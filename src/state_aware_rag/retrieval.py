@@ -31,6 +31,7 @@ class Retriever:
                     chunk_id=chunk.id,
                     body=chunk.body,
                     method=RetrievalMethod.VECTOR,
+                    query=query_text,
                     raw_score=score,
                     raw_rank=rank,
                     source_uri=chunk.source_uri,
@@ -64,6 +65,7 @@ class Retriever:
                     chunk_id=chunk.id,
                     body=chunk.body,
                     method=RetrievalMethod.TEXT,
+                    query=normalized_query,
                     raw_score=score,
                     raw_rank=rank,
                     source_uri=chunk.source_uri,
@@ -97,6 +99,7 @@ class Retriever:
                     chunk_id=chunk.id,
                     body=chunk.body,
                     method=RetrievalMethod.GRAPH,
+                    query="graph:" + ",".join(entities),
                     raw_score=1.0,
                     raw_rank=len(candidates) + 1,
                     source_uri=chunk.source_uri,
@@ -118,6 +121,7 @@ class Retriever:
             methods = tuple(dict.fromkeys(item.method for item in group))
             best = max(group, key=lambda item: item.raw_score)
             method = RetrievalMethod.HYBRID if len(methods) > 1 else best.method
+            query = next((item.query for item in group if item.method == best.method), best.query)
             vector_rank = min(
                 (item.vector_rank if item.vector_rank is not None else item.raw_rank for item in group if item.method == RetrievalMethod.VECTOR),
                 default=None,
@@ -131,6 +135,7 @@ class Retriever:
                     chunk_id=chunk_id,
                     body=best.body,
                     method=method,
+                    query=query,
                     raw_score=sum(item.raw_score for item in group),
                     raw_rank=min(item.raw_rank for item in group),
                     source_uri=best.source_uri,

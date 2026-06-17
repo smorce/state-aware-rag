@@ -213,7 +213,7 @@ class HelixBackedRagStore(SQLiteRagStore):
             params,
             {"embedding": self.embedder.embed_query(query_text), "k": top_k},
         )
-        return self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.VECTOR)
+        return self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.VECTOR, query_text)
 
     def helix_text_search(self, query_text: str, top_k: int) -> list[RetrievalCandidate]:
         params = "defineParams({query:param.string(), k:param.i64()})"
@@ -225,10 +225,11 @@ class HelixBackedRagStore(SQLiteRagStore):
             '.returning(["chunks"])'
         )
         response = self._query_with_values(expression, params, {"query": query_text, "k": top_k})
-        return self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.TEXT)
+        return self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.TEXT, query_text)
 
     def helix_graph_search(self, seed_entities: list[str], working_memory_id: str, top_k: int) -> list[RetrievalCandidate]:
         names = list(dict.fromkeys(seed_entities + self.entities_for_memory(working_memory_id)))
+        graph_query = "graph:" + ",".join(names)
         seed_ids: list[str] = []
         for name in names:
             entity = self.find_entity_by_name(name)
@@ -257,7 +258,12 @@ class HelixBackedRagStore(SQLiteRagStore):
                 "defineParams({entity:param.string(), k:param.i64()})",
                 {"entity": canonical_name, "k": top_k},
             )
-            for candidate in self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.GRAPH):
+            for candidate in self._rows_to_candidates(
+                extract_returned_rows(response, "chunks"),
+                RetrievalMethod.GRAPH,
+                graph_query,
+                graph_reason="Entity 経由で発見",
+            ):
                 if candidate.chunk_id in seen:
                     continue
                 seen.add(candidate.chunk_id)
@@ -277,7 +283,12 @@ class HelixBackedRagStore(SQLiteRagStore):
             "defineParams({working_memory_id:param.string(), k:param.i64()})",
             {"working_memory_id": working_memory_id, "k": top_k},
         )
-        for candidate in self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.GRAPH):
+        for candidate in self._rows_to_candidates(
+            extract_returned_rows(response, "chunks"),
+            RetrievalMethod.GRAPH,
+            graph_query,
+            graph_reason="採用済み Evidence 近傍（メモ由来）で発見",
+        ):
             if candidate.chunk_id in seen:
                 continue
             seen.add(candidate.chunk_id)
@@ -352,16 +363,22 @@ class HelixBackedRagStore(SQLiteRagStore):
                     continue
                 seen.add(chunk_id)
                 filtered_rows.append(row)
-            for candidate in self._rows_to_candidates(filtered_rows, RetrievalMethod.GRAPH):
+            for candidate in self._rows_to_candidates(
+                filtered_rows,
+                RetrievalMethod.GRAPH,
+                f"graph:neighbors:{working_memory_id}",
+                graph_reason="採用済み Evidence と同じ Document の前後 Chunk",
+            ):
                 candidates.append(
                     RetrievalCandidate(
                         chunk_id=candidate.chunk_id,
                         body=candidate.body,
                         method=candidate.method,
+                        query=candidate.query,
                         raw_score=candidate.raw_score,
                         raw_rank=len(candidates) + 1,
                         source_uri=candidate.source_uri,
-                        graph_reason="採用済み Evidence と同じ Document の前後 Chunk",
+                        graph_reason=candidate.graph_reason,
                         retrieval_methods=candidate.retrieval_methods,
                     )
                 )
@@ -396,7 +413,12 @@ class HelixBackedRagStore(SQLiteRagStore):
                 "defineParams({working_memory_id:param.string(), k:param.i64()})",
                 {"working_memory_id": working_memory_id, "k": top_k},
             )
-            for candidate in self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.GRAPH):
+            for candidate in self._rows_to_candidates(
+                extract_returned_rows(response, "chunks"),
+                RetrievalMethod.GRAPH,
+                f"graph:conflicts:{working_memory_id}",
+                graph_reason="矛盾の可能性がある MemoryNote 経由で発見",
+            ):
                 if candidate.chunk_id in seen:
                     continue
                 seen.add(candidate.chunk_id)
@@ -405,10 +427,11 @@ class HelixBackedRagStore(SQLiteRagStore):
                         chunk_id=candidate.chunk_id,
                         body=candidate.body,
                         method=candidate.method,
+                        query=candidate.query,
                         raw_score=candidate.raw_score,
                         raw_rank=len(candidates) + 1,
                         source_uri=candidate.source_uri,
-                        graph_reason="矛盾の可能性がある MemoryNote 経由で発見",
+                        graph_reason=candidate.graph_reason,
                         retrieval_methods=candidate.retrieval_methods,
                     )
                 )
@@ -585,7 +608,7 @@ class HelixBackedRagStore(SQLiteRagStore):
             "defineParams({id:param.string(), working_memory_id:param.string(), round:param.i64(), "
             "candidate_count:param.i64(), accepted_evidence_count:param.i64(), created_note_count:param.i64(), "
             "accepted_note_count:param.i64(), duplicate_count:param.i64(), conflict_count:param.i64(), "
-            "gain:param.f64(), stop_reason:param.string(), actions:param.string()})"
+            "gain:param.f64(), stop_reason:param.string(), actions:param.string(), actions_detail:param.string()})"
         )
         expression = (
             'writeBatch().varAs("round", g().addN("SearchRound", {'
@@ -595,7 +618,7 @@ class HelixBackedRagStore(SQLiteRagStore):
             'created_note_count:PropertyInput.param("created_note_count"), accepted_note_count:PropertyInput.param("accepted_note_count"), '
             'duplicate_count:PropertyInput.param("duplicate_count"), conflict_count:PropertyInput.param("conflict_count"), '
             'gain:PropertyInput.param("gain"), stop_reason:PropertyInput.param("stop_reason"), '
-            'actions:PropertyInput.param("actions")}).valueMap(null)).returning(["round"])'
+            'actions:PropertyInput.param("actions"), actions_detail:PropertyInput.param("actions_detail")}).valueMap(null)).returning(["round"])'
         )
         self._query_with_values(
             expression,
@@ -613,6 +636,7 @@ class HelixBackedRagStore(SQLiteRagStore):
                 "gain": log.gain,
                 "stop_reason": log.stop_reason or "",
                 "actions": json.dumps(log.actions, ensure_ascii=False),
+                "actions_detail": json.dumps(log.action_details, ensure_ascii=False),
             },
         )
 
@@ -645,7 +669,14 @@ class HelixBackedRagStore(SQLiteRagStore):
         )
         self._query_with_values(expression, params, values)
 
-    def _rows_to_candidates(self, rows: list[dict[str, Any]], method: RetrievalMethod) -> list[RetrievalCandidate]:
+    def _rows_to_candidates(
+        self,
+        rows: list[dict[str, Any]],
+        method: RetrievalMethod,
+        query: str,
+        *,
+        graph_reason: str | None = None,
+    ) -> list[RetrievalCandidate]:
         candidates: list[RetrievalCandidate] = []
         for rank, row in enumerate(rows, start=1):
             chunk_id = str(self._row_value(row, "id") or "")
@@ -673,9 +704,11 @@ class HelixBackedRagStore(SQLiteRagStore):
                     chunk_id=chunk_id,
                     body=body,
                     method=method,
+                    query=query,
                     raw_score=raw_score,
                     raw_rank=rank,
                     source_uri=source_uri,
+                    graph_reason=graph_reason,
                     retrieval_methods=(method,),
                     vector_rank=rank if method == RetrievalMethod.VECTOR else None,
                     text_rank=rank if method == RetrievalMethod.TEXT else None,
@@ -688,6 +721,7 @@ class HelixBackedRagStore(SQLiteRagStore):
             chunk_id=candidate.chunk_id,
             body=candidate.body,
             method=candidate.method,
+            query=candidate.query,
             raw_score=candidate.raw_score,
             raw_rank=rank,
             source_uri=candidate.source_uri,

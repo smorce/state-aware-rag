@@ -78,6 +78,7 @@ class Chunk:
     body: str
     embedding: list[float]
     token_count: int
+    position: int
     section_title: str | None
     source_uri: str
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -145,6 +146,7 @@ class RetrievalCandidate:
     chunk_id: str
     body: str
     method: RetrievalMethod
+    query: str
     raw_score: float
     raw_rank: int
     source_uri: str
@@ -196,6 +198,7 @@ class RoundLog:
     gain: float
     stop_reason: str | None
     accepted_evidence_ids: list[str] = field(default_factory=list)
+    action_details: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

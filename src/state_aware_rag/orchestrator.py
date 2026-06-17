@@ -97,7 +97,7 @@ class StateAwareRag:
             )
             if not selected:
                 stop_status = WorkingMemoryStatus.COMPLETED
-                self._record_log(wm.id, round_number, [], 0, [], 0, 0, 0, 0, 0.0, stop_status.value)
+                self._record_log(wm.id, round_number, [], 0, [], 0, 0, 0, 0, 0.0, stop_status.value, action_details=[])
                 break
 
             all_candidates: list[RetrievalCandidate] = []
@@ -108,7 +108,7 @@ class StateAwareRag:
                 all_candidates.extend(self.retriever.graph_search(action.graph_seed_entities, wm.id, self.config.graph_top_k))
 
             merged = self.retriever.merge_candidates(all_candidates)
-            accepted_evidence = self._score_and_save_evidence(question, wm, round_number, selected[0].text_query, merged)
+            accepted_evidence = self._score_and_save_evidence(question, wm, round_number, merged)
             if not accepted_evidence:
                 no_new_note_rounds += 1
                 low_gain_rounds += 1
@@ -120,7 +120,30 @@ class StateAwareRag:
                     open_question_count=len(open_questions),
                     active_note_count=len(notes),
                 )
-                self._record_log(wm.id, round_number, [a.action_id for a in selected], len(merged), [], 0, 0, 0, 0, gain, stop_status.value if stop_status else None)
+                self._record_log(
+                    wm.id,
+                    round_number,
+                    [a.action_id for a in selected],
+                    len(merged),
+                    [],
+                    0,
+                    0,
+                    0,
+                    0,
+                    gain,
+                    stop_status.value if stop_status else None,
+                    action_details=[
+                        {
+                            "action_id": a.action_id,
+                            "sub_question": a.sub_question,
+                            "vector_query": a.vector_query,
+                            "text_query": a.text_query,
+                            "graph_seed_entities": a.graph_seed_entities,
+                            "priority": a.priority,
+                        }
+                        for a in selected
+                    ],
+                )
                 self.store.update_working_memory(wm.id, round_count=round_number)
                 if stop_status:
                     break
@@ -161,6 +184,17 @@ class StateAwareRag:
                 conflict_count,
                 gain,
                 stop_status.value if stop_status else None,
+                action_details=[
+                    {
+                        "action_id": a.action_id,
+                        "sub_question": a.sub_question,
+                        "vector_query": a.vector_query,
+                        "text_query": a.text_query,
+                        "graph_seed_entities": a.graph_seed_entities,
+                        "priority": a.priority,
+                    }
+                    for a in selected
+                ],
             )
             self.store.update_working_memory(wm.id, round_count=round_number)
             if stop_status:
@@ -192,7 +226,6 @@ class StateAwareRag:
         question: str,
         wm: WorkingMemory,
         round_number: int,
-        query: str,
         candidates: list[RetrievalCandidate],
     ) -> list[Evidence]:
         accepted: list[Evidence] = []
@@ -207,7 +240,7 @@ class StateAwareRag:
                     wm.id,
                     candidate.chunk_id,
                     round_number=round_number,
-                    query=query,
+                    query=candidate.query,
                     body_excerpt=candidate.body,
                     retrieval_method=candidate.method,
                     raw_rank=candidate.raw_rank,
@@ -344,6 +377,8 @@ class StateAwareRag:
         conflict_count: int,
         gain: float,
         stop_reason: str | None,
+        *,
+        action_details: list[dict[str, object]] | None = None,
     ) -> None:
         self.store.record_round_log(
             RoundLog(
@@ -359,5 +394,6 @@ class StateAwareRag:
                 gain=gain,
                 stop_reason=stop_reason,
                 accepted_evidence_ids=[ev.id for ev in evidence],
+                action_details=list(action_details or []),
             )
         )

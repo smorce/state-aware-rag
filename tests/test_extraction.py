@@ -26,6 +26,7 @@ def _chunk(body: str) -> Chunk:
         body=body,
         embedding=[0.1, 0.2],
         token_count=10,
+        position=0,
         section_title=None,
         source_uri="memory://test",
         metadata={},
