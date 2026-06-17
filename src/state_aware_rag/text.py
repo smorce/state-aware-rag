@@ -9,6 +9,11 @@ from typing import Iterable
 
 WORD_RE = re.compile(r"[A-Za-z0-9_]+|[\u3040-\u30ff\u3400-\u9fff]+")
 SENTENCE_RE = re.compile(r"(?<=[.!?。！？])\s+")
+JP_CHAR_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uff00-\uffef]")
+JP_SUFFIX_TERMS = ("メモ", "検索", "結果", "質問", "事実", "文書", "本文")
+
+MSG_NO_EVIDENCE = "検索結果が見つからなかったため、回答に必要な根拠を集められませんでした。"
+MSG_DEMEMOIZATION_FAILED = "検索結果は見つかりましたが、質問に直接使える事実として整理できませんでした。"
 
 
 def tokenize(text: str) -> list[str]:
@@ -21,6 +26,41 @@ def split_sentences(text: str) -> list[str]:
 
 def normalize_claim(text: str) -> str:
     return " ".join(tokenize(text))
+
+
+def normalize_for_fulltext(text: str) -> str:
+    value = " ".join(text.split())
+    if not value:
+        return ""
+    if not JP_CHAR_RE.search(value):
+        return " ".join(tokenize(value)) or value
+    try:
+        import budoux
+    except Exception:
+        return value
+    parser = budoux.load_default_japanese_parser()
+    tokens: list[str] = []
+    for phrase in parser.parse(value):
+        stripped = phrase.strip()
+        if not stripped:
+            continue
+        if JP_CHAR_RE.search(stripped):
+            tokens.append(stripped)
+        else:
+            tokens.extend(tokenize(stripped) or [stripped])
+    normalized = " ".join(tokens) or value
+    if " " not in normalized and JP_CHAR_RE.search(normalized) and len(normalized) > 1:
+        for suffix in JP_SUFFIX_TERMS:
+            if normalized.endswith(suffix) and len(normalized) > len(suffix):
+                return f"{normalized[:-len(suffix)]} {suffix}"
+        expanded: list[str] = []
+        for token in tokenize(normalized):
+            if JP_CHAR_RE.search(token):
+                expanded.extend(token)
+            else:
+                expanded.append(token)
+        return " ".join(expanded) or normalized
+    return normalized
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -86,4 +126,3 @@ def compact_fact(sentence: str, max_words: int = 18) -> str:
     if len(words) <= max_words:
         return sentence
     return " ".join(words[:max_words]).rstrip(",;:") + "..."
-

@@ -8,9 +8,9 @@ from state_aware_rag.chunking import Chunker
 from state_aware_rag.config import RagConfig
 from state_aware_rag.embedding import Embedder
 from state_aware_rag.helix import HelixConfig, HelixHttpClient, HelixTypeScriptQueryBuilder, extract_returned_rows
-from state_aware_rag.models import Chunk, Entity, Evidence, IngestedDocument, MemoryNote, RetrievalCandidate, RetrievalMethod, RoundLog, WorkingMemory
+from state_aware_rag.models import Chunk, Entity, Evidence, IngestedDocument, MemoryNote, RetrievalCandidate, RetrievalMethod, RoundLog, WorkingMemory, WorkingMemoryStatus
 from state_aware_rag.store import SQLiteRagStore
-from state_aware_rag.text import extract_entities
+from state_aware_rag.text import extract_entities, normalize_for_fulltext
 
 
 class HelixBackedRagStore(SQLiteRagStore):
@@ -104,6 +104,36 @@ class HelixBackedRagStore(SQLiteRagStore):
         )
         return wm
 
+    def update_working_memory(
+        self,
+        working_memory_id: str,
+        *,
+        status: WorkingMemoryStatus | None = None,
+        round_count: int | None = None,
+    ) -> WorkingMemory:
+        wm = super().update_working_memory(working_memory_id, status=status, round_count=round_count)
+        params = "defineParams({id:param.string(), status:param.string(), round_count:param.i64(), updated_at:param.string()})"
+        expression = (
+            'writeBatch().varAs("wm", '
+            'g().nWithLabel("WorkingMemory").where(Predicate.eqParam("id", "id"))'
+            '.setProperty("status", PropertyInput.param("status"))'
+            '.setProperty("round_count", PropertyInput.param("round_count"))'
+            '.setProperty("updated_at", PropertyInput.param("updated_at"))'
+            '.valueMap(null))'
+            '.returning(["wm"])'
+        )
+        self._query_with_values(
+            expression,
+            params,
+            {
+                "id": wm.id,
+                "status": wm.status.value,
+                "round_count": wm.round_count,
+                "updated_at": wm.updated_at,
+            },
+        )
+        return wm
+
     def create_evidence(self, *args, **kwargs) -> Evidence:
         ev = super().create_evidence(*args, **kwargs)
         self._add_evidence_node(ev)
@@ -140,8 +170,8 @@ class HelixBackedRagStore(SQLiteRagStore):
         super().record_round_log(log)
         self._add_search_round_node(log)
         self._link_nodes("SearchRound", self._round_id(log), "UPDATED", "WorkingMemory", log.working_memory_id)
-        for evidence in self.list_evidence(log.working_memory_id)[-log.accepted_evidence_count:]:
-            self._link_nodes("SearchRound", self._round_id(log), "RETURNED", "Evidence", evidence.id)
+        for evidence_id in log.accepted_evidence_ids:
+            self._link_nodes("SearchRound", self._round_id(log), "RETURNED", "Evidence", evidence_id)
 
     def helix_vector_search(self, query_text: str, top_k: int) -> list[RetrievalCandidate]:
         params = "defineParams({embedding:param.array(param.f64()), k:param.i64()})"
@@ -228,26 +258,62 @@ class HelixBackedRagStore(SQLiteRagStore):
             candidates.append(candidate)
             if len(candidates) >= top_k:
                 break
-        # HelixBackedRagStore は Python の型復元用に SQLite mirror を保持する。
-        # Helix native traversal へ移すまでは、採用済み Evidence と同じ Document の近傍 Chunk を mirror から補完する。
-        for chunk in self.neighbor_chunks_for_evidence(working_memory_id):
-            if chunk.id in seen:
+
+        response = self._query_with_values(
+            (
+                'readBatch().varAs("chunks", '
+                'g().nWithLabel("WorkingMemory").where(Predicate.eqParam("id", "working_memory_id"))'
+                '.out("HAS_NOTE").out("CONFLICTS_WITH").out("SUPPORTED_BY").out("FROM_CHUNK")'
+                '.project([PropertyProjection.new("id"), PropertyProjection.new("body"), '
+                'PropertyProjection.new("source_uri")]).limit(params.k))'
+                '.returning(["chunks"])'
+            ),
+            "defineParams({working_memory_id:param.string(), k:param.i64()})",
+            {"working_memory_id": working_memory_id, "k": top_k},
+        )
+        for candidate in self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.GRAPH):
+            if candidate.chunk_id in seen:
                 continue
-            seen.add(chunk.id)
+            seen.add(candidate.chunk_id)
             candidates.append(
                 RetrievalCandidate(
-                    chunk_id=chunk.id,
-                    body=chunk.body,
-                    method=RetrievalMethod.GRAPH,
-                    raw_score=1.0,
+                    chunk_id=candidate.chunk_id,
+                    body=candidate.body,
+                    method=candidate.method,
+                    raw_score=candidate.raw_score,
                     raw_rank=len(candidates) + 1,
-                    source_uri=chunk.source_uri,
-                    graph_reason="採用済み Evidence と同じ Document の前後 Chunk",
-                    retrieval_methods=(RetrievalMethod.GRAPH,),
+                    source_uri=candidate.source_uri,
+                    graph_reason="矛盾の可能性がある MemoryNote 経由で発見",
+                    retrieval_methods=candidate.retrieval_methods,
                 )
             )
             if len(candidates) >= top_k:
                 break
+        # HelixBackedRagStore は Python の型復元用に SQLite mirror を保持する。
+        # Helix native traversal へ移すまでは、採用済み Evidence と同じ Document の近傍 Chunk を mirror から補完する。
+        mirror_sources = [
+            (self.neighbor_chunks_for_evidence(working_memory_id), "採用済み Evidence と同じ Document の前後 Chunk"),
+            (self.chunks_for_conflicted_notes(working_memory_id), "矛盾の可能性がある MemoryNote 経由で発見"),
+        ]
+        for chunks, reason in mirror_sources:
+            for chunk in chunks:
+                if chunk.id in seen:
+                    continue
+                seen.add(chunk.id)
+                candidates.append(
+                    RetrievalCandidate(
+                        chunk_id=chunk.id,
+                        body=chunk.body,
+                        method=RetrievalMethod.GRAPH,
+                        raw_score=1.0,
+                        raw_rank=len(candidates) + 1,
+                        source_uri=chunk.source_uri,
+                        graph_reason=reason,
+                        retrieval_methods=(RetrievalMethod.GRAPH,),
+                    )
+                )
+                if len(candidates) >= top_k:
+                    return candidates
         return candidates
 
     def _sync_chunk_graph(self, chunk_id: str) -> None:
@@ -316,7 +382,7 @@ class HelixBackedRagStore(SQLiteRagStore):
             {
                 "id": chunk.id,
                 "document_id": chunk.document_id,
-                "body": chunk.body,
+                "body": normalize_for_fulltext(chunk.body) if self.config.fulltext_normalize else chunk.body,
                 "embedding": chunk.embedding,
                 "token_count": chunk.token_count,
                 "section_title": chunk.section_title or "",
@@ -482,6 +548,12 @@ class HelixBackedRagStore(SQLiteRagStore):
             chunk_id = str(row.get("id") or row.get("properties", {}).get("id") or "")
             body = str(row.get("body") or row.get("properties", {}).get("body") or "")
             source_uri = str(row.get("source_uri") or row.get("properties", {}).get("source_uri") or "")
+            try:
+                mirror_chunk = self.get_chunk(chunk_id)
+                body = mirror_chunk.body
+                source_uri = mirror_chunk.source_uri
+            except KeyError:
+                pass
             distance = row.get("distance", row.get("$distance", 0.0))
             try:
                 raw_score = 1.0 / (1.0 + float(distance))

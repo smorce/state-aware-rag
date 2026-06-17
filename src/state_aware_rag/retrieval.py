@@ -5,7 +5,7 @@ from collections import defaultdict
 from state_aware_rag.config import RagConfig
 from state_aware_rag.models import RetrievalCandidate, RetrievalMethod
 from state_aware_rag.store import SQLiteRagStore
-from state_aware_rag.text import bm25_like_score, cosine_similarity
+from state_aware_rag.text import bm25_like_score, cosine_similarity, normalize_for_fulltext
 
 
 class Retriever:
@@ -41,9 +41,19 @@ class Retriever:
         return candidates
 
     def text_search(self, query_text: str, top_k: int | None = None) -> list[RetrievalCandidate]:
+        normalized_query = normalize_for_fulltext(query_text) if self.config.fulltext_normalize else query_text
         if hasattr(self.store, "helix_text_search"):
-            return self.store.helix_text_search(query_text, top_k or self.config.text_top_k)  # type: ignore[attr-defined]
-        scored = [(bm25_like_score(query_text, chunk.body), chunk) for chunk in self.store.list_chunks()]
+            return self.store.helix_text_search(normalized_query, top_k or self.config.text_top_k)  # type: ignore[attr-defined]
+        scored = [
+            (
+                bm25_like_score(
+                    normalized_query,
+                    normalize_for_fulltext(chunk.body) if self.config.fulltext_normalize else chunk.body,
+                ),
+                chunk,
+            )
+            for chunk in self.store.list_chunks()
+        ]
         scored.sort(key=lambda item: item[0], reverse=True)
         candidates: list[RetrievalCandidate] = []
         for rank, (score, chunk) in enumerate(scored[: top_k or self.config.text_top_k], start=1):
@@ -67,15 +77,21 @@ class Retriever:
         if hasattr(self.store, "helix_graph_search"):
             return self.store.helix_graph_search(seed_entities, working_memory_id, top_k or self.config.graph_top_k)  # type: ignore[attr-defined]
         entities = list(dict.fromkeys(seed_entities + self.store.entities_for_memory(working_memory_id)))
-        chunks = self.store.chunks_for_entities(entities)
-        chunks.extend(self.store.neighbor_chunks_for_evidence(working_memory_id))
+        entity_chunks = self.store.chunks_for_entities(entities)
+        neighbor_chunks = self.store.neighbor_chunks_for_evidence(working_memory_id)
+        conflicted_chunks = self.store.chunks_for_conflicted_notes(working_memory_id)
+        chunks = entity_chunks + neighbor_chunks + conflicted_chunks
         seen: set[str] = set()
         candidates: list[RetrievalCandidate] = []
         for chunk in chunks:
             if chunk.id in seen:
                 continue
             seen.add(chunk.id)
-            reason = "Entity、関係グラフ、または採用済み Evidence の近傍から発見"
+            reason = (
+                "矛盾の可能性がある MemoryNote 経由で発見"
+                if chunk in conflicted_chunks
+                else "Entity、関係グラフ、または採用済み Evidence の近傍から発見"
+            )
             candidates.append(
                 RetrievalCandidate(
                     chunk_id=chunk.id,

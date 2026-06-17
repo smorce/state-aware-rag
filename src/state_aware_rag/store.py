@@ -844,6 +844,51 @@ class SQLiteRagStore:
         )
         return [self._row_to_chunk(row) for row in rows]
 
+    def chunks_for_conflicted_notes(self, working_memory_id: str) -> list[Chunk]:
+        rows = self.conn.execute(
+            """
+            WITH conflicted_notes AS (
+              SELECT c.note_b_id AS note_id
+              FROM conflicts c
+              JOIN memory_notes a ON a.id = c.note_a_id
+              WHERE a.working_memory_id = ?
+              UNION
+              SELECT c.note_a_id AS note_id
+              FROM conflicts c
+              JOIN memory_notes b ON b.id = c.note_b_id
+              WHERE b.working_memory_id = ?
+            ),
+            direct_chunks AS (
+              SELECT ch.*
+              FROM conflicted_notes cn
+              JOIN note_evidence ne ON ne.note_id = cn.note_id
+              JOIN evidence e ON e.id = ne.evidence_id
+              JOIN chunks ch ON ch.id = e.chunk_id
+            ),
+            entity_chunks AS (
+              SELECT ch.*
+              FROM conflicted_notes cn
+              JOIN note_entities ne ON ne.note_id = cn.note_id
+              JOIN chunk_entities ce ON ce.entity_id = ne.entity_id
+              JOIN chunks ch ON ch.id = ce.chunk_id
+            )
+            SELECT DISTINCT *
+            FROM (
+              SELECT * FROM direct_chunks
+              UNION
+              SELECT * FROM entity_chunks
+            )
+            ORDER BY id
+            """,
+            (working_memory_id, working_memory_id),
+        )
+        chunks = [self._row_to_chunk(row) for row in rows]
+        return sorted(chunks, key=lambda chunk: self._chunk_position_key(chunk.id))
+
+    def _chunk_position_key(self, chunk_id: str) -> tuple[int, str]:
+        row = self.conn.execute("SELECT rowid FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
+        return (int(row["rowid"]) if row is not None else 0, chunk_id)
+
     def add_open_question(self, working_memory_id: str, question: str, reason: str) -> None:
         self.conn.execute(
             "INSERT OR IGNORE INTO open_questions VALUES (?, ?, ?, 0)",
@@ -882,6 +927,7 @@ class SQLiteRagStore:
                         "actions": log.actions,
                         "candidate_count": log.candidate_count,
                         "accepted_evidence_count": log.accepted_evidence_count,
+                        "accepted_evidence_ids": log.accepted_evidence_ids,
                         "created_note_count": log.created_note_count,
                         "accepted_note_count": log.accepted_note_count,
                         "duplicate_count": log.duplicate_count,

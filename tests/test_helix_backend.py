@@ -6,7 +6,7 @@ from typing import Any
 from state_aware_rag.embedding import HashedEmbedder
 from state_aware_rag.helix import HelixTypeScriptQueryBuilder
 from state_aware_rag.helix_store import HelixBackedRagStore
-from state_aware_rag.models import NoteStatus, RetrievalMethod, RoundLog
+from state_aware_rag.models import NoteStatus, RetrievalMethod, RoundLog, WorkingMemoryStatus
 
 
 class FakeHelixClient:
@@ -94,6 +94,7 @@ def test_helix_backed_store_writes_required_graph_edges(tmp_path: Path) -> None:
             conflict_count=0,
             gain=1.5,
             stop_reason=None,
+            accepted_evidence_ids=[evidence.id],
         )
     )
 
@@ -267,3 +268,108 @@ def test_helix_graph_search_includes_neighbor_chunks(tmp_path: Path) -> None:
 
     assert neighbor_candidates
     assert {candidate.chunk_id for candidate in neighbor_candidates} & {chunk.id for chunk in doc.chunks}
+
+
+def test_helix_update_working_memory_syncs_status(tmp_path: Path) -> None:
+    fake = FakeHelixClient()
+    store = HelixBackedRagStore(tmp_path / "mirror.sqlite3", http_client=fake, embedder=HashedEmbedder())
+    wm = store.create_working_memory("What is stored?")
+
+    updated = store.update_working_memory(wm.id, status=WorkingMemoryStatus.COMPLETED, round_count=2)
+
+    assert updated.status == WorkingMemoryStatus.COMPLETED
+    assert updated.round_count == 2
+    sent = "\n".join(str(request) for request in fake.requests)
+    assert "WorkingMemory" in sent
+    assert "SetProperty" in sent
+    assert "round_count" in sent
+    assert "completed" in sent
+
+
+def test_search_round_links_exact_evidence_ids(tmp_path: Path) -> None:
+    fake = FakeHelixClient()
+    store = HelixBackedRagStore(tmp_path / "mirror.sqlite3", http_client=fake, embedder=HashedEmbedder())
+    doc = store.ingest_document(title="Doc", body="Alpha evidence. Beta evidence.", source_uri="memory://doc")
+    wm = store.create_working_memory("What evidence?")
+    first = store.create_evidence(
+        wm.id,
+        doc.chunks[0].id,
+        round_number=1,
+        query="alpha",
+        body_excerpt=doc.chunks[0].body,
+        retrieval_method=RetrievalMethod.TEXT,
+        raw_rank=1,
+        relevance_score=0.9,
+        memory_value_score=0.9,
+        accepted=True,
+        source_uri="memory://doc",
+    )
+    second = store.create_evidence(
+        wm.id,
+        doc.chunks[0].id,
+        round_number=2,
+        query="beta",
+        body_excerpt=doc.chunks[0].body,
+        retrieval_method=RetrievalMethod.TEXT,
+        raw_rank=1,
+        relevance_score=0.9,
+        memory_value_score=0.9,
+        accepted=True,
+        source_uri="memory://doc",
+    )
+
+    store.record_round_log(
+        RoundLog(
+            working_memory_id=wm.id,
+            round=1,
+            actions=["act_1"],
+            candidate_count=2,
+            accepted_evidence_count=1,
+            created_note_count=0,
+            accepted_note_count=0,
+            duplicate_count=0,
+            conflict_count=0,
+            gain=0.5,
+            stop_reason=None,
+            accepted_evidence_ids=[first.id],
+        )
+    )
+
+    returned_requests = [request for request in fake.requests if "RETURNED" in str(request)]
+    assert len(returned_requests) == 1
+    assert returned_requests[0]["parameters"]["to_id"] == first.id
+    assert returned_requests[0]["parameters"]["to_id"] != second.id
+
+
+def test_helix_graph_search_queries_conflicts_with(tmp_path: Path) -> None:
+    fake = FakeHelixClient()
+    store = HelixBackedRagStore(tmp_path / "mirror.sqlite3", http_client=fake, embedder=HashedEmbedder())
+
+    store.helix_graph_search([], "wm_1", 5)
+
+    sent = "\n".join(str(request) for request in fake.requests)
+    assert "CONFLICTS_WITH" in sent
+
+
+def test_helix_ingest_normalizes_chunk_body_for_text_index(tmp_path: Path) -> None:
+    fake = FakeHelixClient()
+    store = HelixBackedRagStore(tmp_path / "mirror.sqlite3", http_client=fake, embedder=HashedEmbedder())
+
+    doc = store.ingest_document(
+        title="日本語",
+        body="作業用メモは質問ごとに事実を保持する。",
+        source_uri="memory://jp",
+        chunk_size=200,
+        overlap=0,
+        extract_entities=False,
+    )
+
+    chunk_requests = [
+        request
+        for request in fake.requests
+        if request.get("parameters", {}).get("id") == doc.chunks[0].id
+        and request.get("parameters", {}).get("document_id") == doc.document.id
+    ]
+    assert chunk_requests
+    assert chunk_requests[0]["parameters"]["body"] != doc.chunks[0].body
+    assert " " in chunk_requests[0]["parameters"]["body"]

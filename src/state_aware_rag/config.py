@@ -18,4 +18,4 @@ class RagConfig:
     embedding_dimensions: int = 128
     embedding_backend: str = "ruri"
     chunker_backend: str = "auto"
-
+    fulltext_normalize: bool = True

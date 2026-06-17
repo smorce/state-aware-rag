@@ -195,6 +195,7 @@ class RoundLog:
     conflict_count: int
     gain: float
     stop_reason: str | None
+    accepted_evidence_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

@@ -30,6 +30,8 @@ uv run state-aware-rag --db .\helix_mirror.sqlite3 ask "この文書の要点は
 
 日本語本文は budoux で文節境界に分割した上でチャンク化します (`BudouxChunker`)。英語など日本語を含まない本文は従来通り文字数ベースで分割されます。チャンカーの強制切り替えは `RagConfig(chunker_backend="char")` で行えます。
 
+HelixDB backend では、日本語全文検索のため query と Helix 側 `Chunk.body` を `normalize_for_fulltext` で同じスペース区切り表現に正規化します。既存 ingest 済みデータにこの正規化を反映するには、対象文書を再 ingest してください。SQLite mirror には表示・Evidence 用の原文を保持します。
+
 Bosun XS を使う場合 (既定):
 
 ```powershell
@@ -89,7 +91,7 @@ PYTHONUTF8=1 UV_LINK_MODE=copy uv run state-aware-rag \
   --db helix_mirror.sqlite3 ask "この文書の要点は？" --llm server --bosun xs
 ```
 
-`--backend helix` は HelixDB に `Document` / `Chunk` / `Entity` / `Question` / `WorkingMemory` / `Evidence` / `MemoryNote` / `SearchRound` ノードを書き込み、`HAS_CHUNK` / `MENTIONS` / `HAS_MEMORY` / `FROM_CHUNK` / `HAS_NOTE` / `SUPPORTED_BY` / `RELATED_TO` / `DUPLICATE_OF` / `RETURNED` / `UPDATED` などの主要エッジを張ります。検索時は HelixDB の `vectorSearchNodesWith`、`textSearchNodesWith`、`Entity <- MENTIONS - Chunk` と `WorkingMemory -> HAS_NOTE -> SUPPORTED_BY -> FROM_CHUNK` の graph traversal を使います。さらに採用済み Evidence と同じ Document の前後 Chunk を SQLite mirror から補完します。Python 側の SQLite は ID と型復元の mirror として残します。
+`--backend helix` は HelixDB に `Document` / `Chunk` / `Entity` / `Question` / `WorkingMemory` / `Evidence` / `MemoryNote` / `SearchRound` ノードを書き込み、`HAS_CHUNK` / `MENTIONS` / `HAS_MEMORY` / `FROM_CHUNK` / `HAS_NOTE` / `SUPPORTED_BY` / `RELATED_TO` / `DUPLICATE_OF` / `CONFLICTS_WITH` / `RETURNED` / `UPDATED` などの主要エッジを張ります。検索時は HelixDB の `vectorSearchNodesWith`、`textSearchNodesWith`、`Entity <- MENTIONS - Chunk`、`WorkingMemory -> HAS_NOTE -> SUPPORTED_BY -> FROM_CHUNK`、`WorkingMemory -> HAS_NOTE -> CONFLICTS_WITH -> SUPPORTED_BY -> FROM_CHUNK` の graph traversal を使います。さらに採用済み Evidence と同じ Document の前後 Chunk と conflict 関連 Chunk を SQLite mirror から補完します。Python 側の SQLite は ID と型復元の mirror として残します。
 
 ## テスト
 

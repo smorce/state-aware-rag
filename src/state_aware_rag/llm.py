@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from state_aware_rag.models import Evidence, MemoryNote, OpenQuestion
-from state_aware_rag.text import compact_fact, extract_entities, normalize_claim, split_sentences, tokenize
+from state_aware_rag.text import MSG_NO_EVIDENCE, compact_fact, extract_entities, normalize_claim, split_sentences, tokenize
 
 
 class PlannerAndWriter(Protocol):
@@ -82,7 +82,7 @@ class LocalHeuristicLLM:
         open_questions: list[OpenQuestion],
     ) -> str:
         if not memory_notes:
-            return "検索結果が見つからなかったため、回答に必要な根拠を集められませんでした。"
+            return MSG_NO_EVIDENCE
         lines = ["作業用メモから確認できた範囲では、次の通りです。"]
         if conflicts:
             lines.append("作業用メモ内に矛盾する情報があります。")

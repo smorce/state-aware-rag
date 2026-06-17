@@ -19,7 +19,7 @@ from state_aware_rag.models import (
 from state_aware_rag.retrieval import Retriever
 from state_aware_rag.store import SQLiteRagStore
 from state_aware_rag.strategy import SearchStrategy, SocraticSearchStrategy
-from state_aware_rag.text import normalize_claim, overlap_score
+from state_aware_rag.text import MSG_DEMEMOIZATION_FAILED, normalize_claim, overlap_score
 
 
 class StateAwareRag:
@@ -62,6 +62,16 @@ class StateAwareRag:
 
     def answer(self, question: str) -> AnswerResult:
         wm = self.store.create_working_memory(question)
+        try:
+            return self._answer_with_working_memory(question, wm)
+        except Exception:
+            try:
+                self.store.update_working_memory(wm.id, status=WorkingMemoryStatus.FAILED)
+            except Exception:
+                pass
+            raise
+
+    def _answer_with_working_memory(self, question: str, wm: WorkingMemory) -> AnswerResult:
         no_new_note_rounds = 0
         low_gain_rounds = 0
         previous_queries: list[str] = []
@@ -163,12 +173,16 @@ class StateAwareRag:
         evidence_by_note = {note.id: self.store.evidence_for_note(note.id) for note in notes}
         open_questions = self._open_questions(wm.id)
         conflicts = self.store.list_conflicts(wm.id)
-        answer = self.llm.generate_final_answer(question, notes, evidence_by_note, conflicts, open_questions)
+        evidence = self.store.list_evidence(wm.id)
+        if evidence and not notes:
+            answer = MSG_DEMEMOIZATION_FAILED
+        else:
+            answer = self.llm.generate_final_answer(question, notes, evidence_by_note, conflicts, open_questions)
         return AnswerResult(
             answer=answer,
             working_memory=wm,
             memory_notes=notes,
-            evidence=self.store.list_evidence(wm.id),
+            evidence=evidence,
             open_questions=open_questions,
             conflicts=conflicts,
         )
@@ -344,5 +358,6 @@ class StateAwareRag:
                 conflict_count=conflict_count,
                 gain=gain,
                 stop_reason=stop_reason,
+                accepted_evidence_ids=[ev.id for ev in evidence],
             )
         )
