@@ -27,9 +27,6 @@ PyTorch は **CUDA 12.4 ビルド（`torch==2.6.0+cu124`）** を使用します
 # Helix TypeScript SDK（初回のみ）
 cd vendor/helix-db/sdks/typescript && npm install && npm run build && cd -
 
-# llama-server（例: ポート 1067）
-curl -s http://127.0.0.1:1067/health
-
 # HelixDB（ruri 768 次元用にクリーンなインスタンスを起動）
 .tools/helix init --path helix_project --no-skills local
 cd helix_project && ../.tools/helix start --port 6969 dev && cd ..
@@ -42,6 +39,13 @@ Invalid vector dimension: expected 128, got 768
 ```
 
 ベクトル次元を変える場合は `helix prune --all --yes` でローカル状態を消してから再起動してください。
+
+
+# llama-server の確認方法（例: ポート 1067）
+
+```
+curl -s http://127.0.0.1:1067/health
+```
 
 ## 本番スモークテスト（sample.md）
 
