@@ -7,7 +7,8 @@ import unicodedata
 from typing import Any, Protocol
 
 from state_aware_rag.embedding import Embedder
-from state_aware_rag.llm import LlamaServerEnvConfig, _extract_json_object
+from state_aware_rag.json_parse import parse_json_object
+from state_aware_rag.llm import LlamaServerEnvConfig
 from state_aware_rag.models import Chunk, Entity, EntityType, ExtractionResult, Relation, new_id, now_iso
 from state_aware_rag.text import cosine_similarity, extract_entities, overlap_score
 
@@ -305,12 +306,9 @@ class LlmEntityExtractor:
 
             text = asyncio.run(self.config.complete(prompt))
             try:
-                payload = json.loads(text)
-            except json.JSONDecodeError:
-                extracted = _extract_json_object(text)
-                if extracted is None:
-                    raise RuntimeError("invalid JSON from llama-server")
-                payload = extracted
+                payload = parse_json_object(text)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("invalid JSON from llama-server") from exc
             if not isinstance(payload, dict):
                 return ExtractionResult(chunk_id=chunk.id, entities=(), relations=())
             return _parse_llm_payload(chunk, payload, self.embedder)

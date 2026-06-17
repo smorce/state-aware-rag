@@ -7,6 +7,7 @@ import random
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from state_aware_rag.json_parse import parse_json_object
 from state_aware_rag.models import Evidence, MemoryNote, OpenQuestion
 from state_aware_rag.text import MSG_NO_EVIDENCE, compact_fact, extract_entities, normalize_claim, split_sentences, tokenize
 
@@ -284,12 +285,20 @@ class JsonLlamaPlannerAndWriter(LocalHeuristicLLM):
     def _complete_json(self, prompt: str) -> dict[str, Any]:
         text = asyncio.run(self.config.complete(prompt))
         try:
-            return json.loads(text)
+            return parse_json_object(text)
         except json.JSONDecodeError:
-            extracted = _extract_json_object(text)
-            if extracted is None:
-                raise RuntimeError(f"llama-server returned invalid JSON: {text}")
-            return extracted
+            # 2回目は「厳密JSONのみ」を強制して再試行する（副作用なし）。
+            retry_prompt = (
+                prompt
+                + "\n\n重要: 出力は **RFC8259 準拠の厳密な JSON のみ**。"
+                + " trailing comma を入れない。文字列は必ず二重引用符で囲む。"
+                + " 余計な説明・Markdown・コードフェンスを一切出力しない。"
+            )
+            text2 = asyncio.run(self.config.complete(retry_prompt))
+            try:
+                return parse_json_object(text2)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"llama-server returned invalid JSON after retry: {text2}") from exc
 
     def plan(self, question: str, working_memory: list[MemoryNote], open_questions: list[OpenQuestion], round_number: int, max_actions: int) -> list[dict[str, Any]]:
         prompt = f"""
@@ -409,31 +418,3 @@ class JsonLlamaPlannerAndWriter(LocalHeuristicLLM):
 - 出典がある場合は、対応する出典を示す。
 """
         return asyncio.run(self.config.complete(prompt)).strip()
-
-
-def _extract_json_object(text: str) -> dict[str, Any] | None:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start : index + 1])
-    return None
