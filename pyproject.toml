@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "budoux>=0.8.4",
     "openai>=1.0",
+    "openpyxl>=3.1",
     "sentence-transformers>=3.0",
     "torch",
 ]

@@ -77,6 +77,31 @@ class RuriEmbedder:
         self._model: object | None = None
         self._dimensions: int | None = None
 
+    def _resolve_device(self) -> str:
+        requested = (self.device or os.getenv("RURI_DEVICE", "cuda")).strip().lower()
+        if requested == "cpu":
+            return "cpu"
+        if requested not in {"cuda", "gpu"}:
+            raise ValueError(f"Unsupported RURI_DEVICE: {requested!r}. Use cuda or cpu.")
+        try:
+            import torch  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise RuntimeError(
+                "RuriEmbedder requires `torch`. Run `uv sync` to install dependencies."
+            ) from exc
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "RURI_DEVICE is cuda but CUDA is not available. "
+                "Install a compatible NVIDIA driver or set RURI_DEVICE=cpu."
+            )
+        try:
+            torch.zeros(1, device="cuda")
+        except Exception as exc:
+            raise RuntimeError(
+                f"RURI_DEVICE is cuda but GPU initialization failed: {exc}"
+            ) from exc
+        return "cuda"
+
     def _ensure_model(self) -> object:
         if self._model is None:
             try:
@@ -92,7 +117,7 @@ class RuriEmbedder:
                     "RuriEmbedder requires `sentence-transformers`. "
                     "Run `uv sync` to install dependencies."
                 ) from exc
-            device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            device = self._resolve_device()
             model = SentenceTransformer(self.model_name, device=device)
             get_dim = getattr(model, "get_embedding_dimension", model.get_sentence_embedding_dimension)
             dim = int(get_dim() or 0)
@@ -136,12 +161,13 @@ class RuriEmbedder:
         return self._encode([text], "document")[0]
 
 
-def build_embedder(backend: str, *, dimensions: int = 128) -> Embedder:
+def build_embedder(backend: str, *, dimensions: int = 128, device: str | None = None) -> Embedder:
     name = (backend or "").strip().lower()
     if name in {"hashed"}:
         return HashedEmbedder(dimensions=dimensions)
     if name in {"", "auto", "default", "ruri"}:
-        return RuriEmbedder()
+        resolved_device = device or os.getenv("RURI_DEVICE")
+        return RuriEmbedder(device=resolved_device)
     raise ValueError(f"Unknown embedding backend: {backend}")
 
 

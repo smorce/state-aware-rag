@@ -15,6 +15,11 @@ tmp_helix_mirror.sqlite3
 
 # Helix ローカル状態
 helix_project/.helix/
+helix_project_ruri/.helix/
+
+# RAG 実行ログ（README は追跡）
+logs/*.jsonl
+logs/*.xlsx
 
 # データセットの重複アーカイブ（展開済み corpus は data/beir/ に保持）
 data/scifact.zip

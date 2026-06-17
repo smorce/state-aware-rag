@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from state_aware_rag.bosun import RuleBosunScorer
 from state_aware_rag.config import RagConfig
+from state_aware_rag.language import detect_language
 from state_aware_rag.llm import LocalHeuristicLLM, PlannerAndWriter
 from state_aware_rag.models import (
     AnswerResult,
@@ -17,9 +18,29 @@ from state_aware_rag.models import (
     NoteStatus,
 )
 from state_aware_rag.retrieval import Retriever
+from state_aware_rag.run_log import (
+    ROUTE_ANSWER_FINAL_DEMEMOIZATION_FAILED,
+    ROUTE_ANSWER_FINAL_NO_EVIDENCE,
+    ROUTE_ANSWER_FINAL_STOPPED,
+    ROUTE_ANSWER_FINAL_SUCCESS,
+    ROUTE_ANSWER_SESSION_START,
+    ROUTE_ANSWER_UNHANDLED_EXCEPTION,
+    ROUTE_ROUND_ATOMIC_NOTES_CREATED,
+    ROUTE_ROUND_ATOMIC_NOTES_EMPTY,
+    ROUTE_ROUND_NO_ACCEPTED_EVIDENCE,
+    ROUTE_ROUND_NO_ACTIONS,
+    ROUTE_ROUND_NOTE_ACCEPTED,
+    ROUTE_ROUND_NOTE_CONFLICT,
+    ROUTE_ROUND_NOTE_DUPLICATE,
+    ROUTE_ROUND_RETRIEVAL_EMPTY,
+    ROUTE_SCORE_CANDIDATE_ACCEPTED,
+    ROUTE_SCORE_CANDIDATE_REJECTED_MEMORY_VALUE,
+    ROUTE_SCORE_CANDIDATE_REJECTED_RELEVANCE,
+    RunLogger,
+)
 from state_aware_rag.store import SQLiteRagStore
 from state_aware_rag.strategy import SearchStrategy, SocraticSearchStrategy
-from state_aware_rag.text import MSG_DEMEMOIZATION_FAILED, normalize_claim, overlap_score
+from state_aware_rag.text import MSG_DEMEMOIZATION_FAILED, MSG_NO_EVIDENCE, normalize_claim, overlap_score
 
 
 class StateAwareRag:
@@ -31,6 +52,7 @@ class StateAwareRag:
         llm: PlannerAndWriter | None = None,
         bosun: RuleBosunScorer | None = None,
         search_strategy: SearchStrategy | None = None,
+        run_logger: RunLogger | None = None,
     ) -> None:
         self.config = config or store.config
         self.store = store
@@ -38,6 +60,7 @@ class StateAwareRag:
         self.llm = llm or LocalHeuristicLLM()
         self.bosun = bosun or RuleBosunScorer()
         self.search_strategy = search_strategy or SocraticSearchStrategy(self.llm, self.config)
+        self._run_logger = run_logger
 
     def ingest_document(
         self,
@@ -61,21 +84,48 @@ class StateAwareRag:
         )
 
     def answer(self, question: str) -> AnswerResult:
+        language = detect_language(question)
+        logger = self._run_logger or RunLogger.for_question(
+            question,
+            language,
+            enabled=self.config.run_log_enabled,
+        )
+        logger.log(
+            ROUTE_ANSWER_SESSION_START,
+            component="orchestrator",
+            outcome="success",
+            reason_code="session_started",
+            reason_detail="answer() started",
+            extra={"bosun": type(self.bosun).__name__, "llm": type(self.llm).__name__},
+        )
         wm = self.store.create_working_memory(question)
         try:
-            return self._answer_with_working_memory(question, wm)
-        except Exception:
+            result = self._answer_with_working_memory(question, wm, logger)
+            logger.flush_excel()
+            return result
+        except Exception as exc:
+            logger.log(
+                ROUTE_ANSWER_UNHANDLED_EXCEPTION,
+                component="orchestrator",
+                outcome="failure",
+                reason_code="unhandled_exception",
+                reason_detail=str(exc),
+                working_memory_id=wm.id,
+                extra={"exception_type": type(exc).__name__},
+            )
             try:
                 self.store.update_working_memory(wm.id, status=WorkingMemoryStatus.FAILED)
             except Exception:
                 pass
+            logger.flush_excel()
             raise
 
-    def _answer_with_working_memory(self, question: str, wm: WorkingMemory) -> AnswerResult:
+    def _answer_with_working_memory(self, question: str, wm: WorkingMemory, logger: RunLogger) -> AnswerResult:
         no_new_note_rounds = 0
         low_gain_rounds = 0
         previous_queries: list[str] = []
         stop_status: WorkingMemoryStatus | None = None
+        relevance_threshold, memory_value_threshold, question_language = self.config.scoring_thresholds(question)
 
         for round_number in range(1, self.config.max_rounds + 1):
             notes = self.store.list_memory_notes(wm.id)
@@ -97,6 +147,16 @@ class StateAwareRag:
             )
             if not selected:
                 stop_status = WorkingMemoryStatus.COMPLETED
+                logger.log(
+                    ROUTE_ROUND_NO_ACTIONS,
+                    component="strategy",
+                    outcome="success",
+                    reason_code="no_actions_selected",
+                    reason_detail="Search strategy returned no further actions; treating as completed.",
+                    working_memory_id=wm.id,
+                    round_number=round_number,
+                    stop_status=stop_status.value,
+                )
                 self._record_log(wm.id, round_number, [], 0, [], 0, 0, 0, 0, 0.0, stop_status.value, action_details=[])
                 break
 
@@ -108,7 +168,29 @@ class StateAwareRag:
                 all_candidates.extend(self.retriever.graph_search(action.graph_seed_entities, wm.id, self.config.graph_top_k))
 
             merged = self.retriever.merge_candidates(all_candidates)
-            accepted_evidence = self._score_and_save_evidence(question, wm, round_number, merged)
+            if not merged:
+                logger.log(
+                    ROUTE_ROUND_RETRIEVAL_EMPTY,
+                    component="retrieval",
+                    outcome="failure",
+                    reason_code="no_candidates",
+                    reason_detail="vector/text/graph search returned no mergeable candidates",
+                    working_memory_id=wm.id,
+                    round_number=round_number,
+                    candidate_count=0,
+                    relevance_threshold=relevance_threshold,
+                    memory_value_threshold=memory_value_threshold,
+                )
+            accepted_evidence = self._score_and_save_evidence(
+                question,
+                wm,
+                round_number,
+                merged,
+                logger,
+                relevance_threshold=relevance_threshold,
+                memory_value_threshold=memory_value_threshold,
+                question_language=question_language,
+            )
             if not accepted_evidence:
                 no_new_note_rounds += 1
                 low_gain_rounds += 1
@@ -119,6 +201,24 @@ class StateAwareRag:
                     low_gain_rounds,
                     open_question_count=len(open_questions),
                     active_note_count=len(notes),
+                )
+                logger.log(
+                    ROUTE_ROUND_NO_ACCEPTED_EVIDENCE,
+                    component="orchestrator",
+                    outcome="failure",
+                    reason_code="all_candidates_rejected",
+                    reason_detail=(
+                        f"No evidence accepted in round {round_number}. "
+                        f"See score.candidate_rejected.* rows for per-candidate reasons."
+                    ),
+                    working_memory_id=wm.id,
+                    round_number=round_number,
+                    candidate_count=len(merged),
+                    accepted_evidence_count=0,
+                    relevance_threshold=relevance_threshold,
+                    memory_value_threshold=memory_value_threshold,
+                    stop_status=stop_status.value if stop_status else None,
+                    extra={"question_language": question_language},
                 )
                 self._record_log(
                     wm.id,
@@ -150,7 +250,37 @@ class StateAwareRag:
                 continue
 
             created_notes = self.llm.create_atomic_notes(question, self.store.list_memory_notes(wm.id), accepted_evidence)
-            accepted_count, duplicate_count, conflict_count = self._save_notes(wm.id, round_number, created_notes)
+            note_items = list(created_notes.get("notes", []))
+            if not note_items:
+                logger.log(
+                    ROUTE_ROUND_ATOMIC_NOTES_EMPTY,
+                    component="llm",
+                    outcome="failure",
+                    reason_code="atomic_notes_empty",
+                    reason_detail="LLM returned zero atomic notes for accepted evidence",
+                    working_memory_id=wm.id,
+                    round_number=round_number,
+                    accepted_evidence_count=len(accepted_evidence),
+                    created_note_count=0,
+                )
+            else:
+                logger.log(
+                    ROUTE_ROUND_ATOMIC_NOTES_CREATED,
+                    component="llm",
+                    outcome="success",
+                    reason_code="atomic_notes_created",
+                    reason_detail=f"LLM returned {len(note_items)} note candidate(s)",
+                    working_memory_id=wm.id,
+                    round_number=round_number,
+                    accepted_evidence_count=len(accepted_evidence),
+                    created_note_count=len(note_items),
+                )
+            accepted_count, duplicate_count, conflict_count = self._save_notes(
+                wm.id,
+                round_number,
+                created_notes,
+                logger,
+            )
             if created_notes.get("open_questions"):
                 for item in created_notes["open_questions"]:
                     self.store.add_open_question(wm.id, str(item["question"]), str(item.get("reason", "")))
@@ -163,7 +293,6 @@ class StateAwareRag:
             gain = accepted_count + 0.5 * len(accepted_evidence) - 0.5 * duplicate_count - 0.5 * conflict_count
             current_open_questions = self._open_questions(wm.id)
             current_active_note_count = len(self.store.list_memory_notes(wm.id))
-            # 全候補低スコアが続く場合は accepted evidence が空のラウンドと同じ低 gain 停止へ集約する。
             low_gain_rounds = low_gain_rounds + 1 if gain <= 0 else 0
             stop_status = self._stop_status(
                 round_number,
@@ -178,7 +307,7 @@ class StateAwareRag:
                 [a.action_id for a in selected],
                 len(merged),
                 accepted_evidence,
-                len(created_notes.get("notes", [])),
+                len(note_items),
                 accepted_count,
                 duplicate_count,
                 conflict_count,
@@ -210,8 +339,52 @@ class StateAwareRag:
         evidence = self.store.list_evidence(wm.id)
         if evidence and not notes:
             answer = MSG_DEMEMOIZATION_FAILED
+            logger.log(
+                ROUTE_ANSWER_FINAL_DEMEMOIZATION_FAILED,
+                component="orchestrator",
+                outcome="failure",
+                reason_code="dememoization_failed",
+                reason_detail=MSG_DEMEMOIZATION_FAILED,
+                working_memory_id=wm.id,
+                accepted_evidence_count=len(evidence),
+                created_note_count=0,
+                stop_status=stop_status.value,
+            )
+        elif not evidence:
+            answer = MSG_NO_EVIDENCE
+            logger.log(
+                ROUTE_ANSWER_FINAL_NO_EVIDENCE,
+                component="orchestrator",
+                outcome="failure",
+                reason_code="no_evidence",
+                reason_detail=MSG_NO_EVIDENCE,
+                working_memory_id=wm.id,
+                accepted_evidence_count=0,
+                stop_status=stop_status.value,
+            )
         else:
             answer = self.llm.generate_final_answer(question, notes, evidence_by_note, conflicts, open_questions)
+            logger.log(
+                ROUTE_ANSWER_FINAL_SUCCESS,
+                component="llm",
+                outcome="success",
+                reason_code="final_answer_generated",
+                reason_detail="Final answer generated from memory notes",
+                working_memory_id=wm.id,
+                accepted_evidence_count=len(evidence),
+                accepted_note_count=len(notes),
+                stop_status=stop_status.value,
+            )
+        if stop_status != WorkingMemoryStatus.COMPLETED:
+            logger.log(
+                ROUTE_ANSWER_FINAL_STOPPED,
+                component="orchestrator",
+                outcome="skipped",
+                reason_code=stop_status.value,
+                reason_detail=f"Loop stopped with status={stop_status.value}",
+                working_memory_id=wm.id,
+                stop_status=stop_status.value,
+            )
         return AnswerResult(
             answer=answer,
             working_memory=wm,
@@ -227,34 +400,109 @@ class StateAwareRag:
         wm: WorkingMemory,
         round_number: int,
         candidates: list[RetrievalCandidate],
+        logger: RunLogger,
+        *,
+        relevance_threshold: float,
+        memory_value_threshold: float,
+        question_language: str,
     ) -> list[Evidence]:
         accepted: list[Evidence] = []
         summary = self._memory_summary(wm.id)
         for candidate in candidates:
             relevance = self.bosun.relevance_score(question, summary, candidate)
             memory_value = self.bosun.memory_value_score(question, summary, candidate)
-            if relevance < self.config.relevance_threshold or memory_value < self.config.memory_value_threshold:
-                continue
-            accepted.append(
-                self.store.create_evidence(
-                    wm.id,
-                    candidate.chunk_id,
+            if relevance < relevance_threshold:
+                logger.log(
+                    ROUTE_SCORE_CANDIDATE_REJECTED_RELEVANCE,
+                    component="bosun",
+                    outcome="failure",
+                    reason_code="relevance_below_threshold",
+                    reason_detail=(
+                        f"relevance={relevance:.4f} < threshold={relevance_threshold:.4f} "
+                        f"(language={question_language})"
+                    ),
+                    working_memory_id=wm.id,
                     round_number=round_number,
-                    query=candidate.query,
-                    body_excerpt=candidate.body,
-                    retrieval_method=candidate.method,
-                    raw_rank=candidate.raw_rank,
+                    chunk_id=candidate.chunk_id,
                     relevance_score=relevance,
                     memory_value_score=memory_value,
-                    accepted=True,
-                    source_uri=candidate.source_uri,
+                    relevance_threshold=relevance_threshold,
+                    memory_value_threshold=memory_value_threshold,
+                    extra={
+                        "question_language": question_language,
+                        "retrieval_methods": [m.value for m in candidate.retrieval_methods],
+                        "source_uri": candidate.source_uri,
+                    },
                 )
+                continue
+            if memory_value < memory_value_threshold:
+                logger.log(
+                    ROUTE_SCORE_CANDIDATE_REJECTED_MEMORY_VALUE,
+                    component="bosun",
+                    outcome="failure",
+                    reason_code="memory_value_below_threshold",
+                    reason_detail=(
+                        f"memory_value={memory_value:.4f} < threshold={memory_value_threshold:.4f} "
+                        f"(language={question_language})"
+                    ),
+                    working_memory_id=wm.id,
+                    round_number=round_number,
+                    chunk_id=candidate.chunk_id,
+                    relevance_score=relevance,
+                    memory_value_score=memory_value,
+                    relevance_threshold=relevance_threshold,
+                    memory_value_threshold=memory_value_threshold,
+                    extra={
+                        "question_language": question_language,
+                        "retrieval_methods": [m.value for m in candidate.retrieval_methods],
+                        "source_uri": candidate.source_uri,
+                    },
+                )
+                continue
+            evidence = self.store.create_evidence(
+                wm.id,
+                candidate.chunk_id,
+                round_number=round_number,
+                query=candidate.query,
+                body_excerpt=candidate.body,
+                retrieval_method=candidate.method,
+                raw_rank=candidate.raw_rank,
+                relevance_score=relevance,
+                memory_value_score=memory_value,
+                accepted=True,
+                source_uri=candidate.source_uri,
+            )
+            accepted.append(evidence)
+            logger.log(
+                ROUTE_SCORE_CANDIDATE_ACCEPTED,
+                component="bosun",
+                outcome="success",
+                reason_code="candidate_accepted",
+                reason_detail=(
+                    f"relevance={relevance:.4f}, memory_value={memory_value:.4f} "
+                    f"(language={question_language})"
+                ),
+                working_memory_id=wm.id,
+                round_number=round_number,
+                chunk_id=candidate.chunk_id,
+                relevance_score=relevance,
+                memory_value_score=memory_value,
+                relevance_threshold=relevance_threshold,
+                memory_value_threshold=memory_value_threshold,
+                extra={"evidence_id": evidence.id, "source_uri": candidate.source_uri},
             )
             if len(accepted) >= self.config.max_accepted_evidence_per_round:
                 break
         return accepted
 
-    def _save_notes(self, working_memory_id: str, round_number: int, payload: dict[str, object]) -> tuple[int, int, int]:
+    def _save_notes(
+        self,
+        working_memory_id: str,
+        round_number: int,
+        payload: dict[str, object],
+        logger: RunLogger | None = None,
+    ) -> tuple[int, int, int]:
+        log = logger or RunLogger(enabled=False)
         accepted_count = 0
         duplicate_count = 0
         conflict_count = 0
@@ -289,6 +537,16 @@ class StateAwareRag:
                 self.store.add_duplicate_edge(shadow.id, duplicate_note.id, duplicate_score)
                 self._resolve_open_questions_for_claim(working_memory_id, claim)
                 duplicate_count += 1
+                log.log(
+                    ROUTE_ROUND_NOTE_DUPLICATE,
+                    component="bosun",
+                    outcome="skipped",
+                    reason_code="duplicate_note",
+                    reason_detail=f"duplicate_score={duplicate_score:.4f} >= {self.config.duplicate_threshold:.4f}",
+                    working_memory_id=working_memory_id,
+                    round_number=round_number,
+                    extra={"shadow_note_id": shadow.id, "canonical_note_id": duplicate_note.id, "claim": claim},
+                )
                 continue
 
             support_score, relevance_score = self._scores_for_evidence(evidence_ids, fallback=float(note_item.get("confidence", 0.75)))
@@ -314,7 +572,27 @@ class StateAwareRag:
             for existing_id, score in conflicts:
                 self.store.add_conflict(existing_id, note.id, score)
                 conflict_count += 1
+                log.log(
+                    ROUTE_ROUND_NOTE_CONFLICT,
+                    component="bosun",
+                    outcome="skipped",
+                    reason_code="note_conflict",
+                    reason_detail=f"conflict_score={score:.4f} >= {self.config.conflict_threshold:.4f}",
+                    working_memory_id=working_memory_id,
+                    round_number=round_number,
+                    extra={"note_id": note.id, "conflicting_note_id": existing_id, "claim": claim},
+                )
             accepted_count += 1
+            log.log(
+                ROUTE_ROUND_NOTE_ACCEPTED,
+                component="orchestrator",
+                outcome="success",
+                reason_code="note_accepted",
+                reason_detail="New active memory note created",
+                working_memory_id=working_memory_id,
+                round_number=round_number,
+                extra={"note_id": note.id, "claim": claim},
+            )
         return accepted_count, duplicate_count, conflict_count
 
     def _scores_for_evidence(self, evidence_ids: list[str], *, fallback: float) -> tuple[float, float]:

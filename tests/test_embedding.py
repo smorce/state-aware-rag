@@ -68,7 +68,8 @@ def test_build_embedder_rejects_unknown_backend() -> None:
     importlib.util.find_spec("sentence_transformers") is None,
     reason="sentence-transformers is an optional dependency; install with .[ruri] to run.",
 )
-def test_ruri_embedder_loads_when_dependency_available() -> None:
+def test_ruri_embedder_loads_when_dependency_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RURI_DEVICE", "cpu")
     embedder = RuriEmbedder()
     vector = embedder.embed_query("State-Aware RAG")
 
