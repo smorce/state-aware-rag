@@ -61,12 +61,15 @@ uv run state-aware-rag \
 
 ## SciFact 本番テスト（データセット）
 
+ユーザーから指示があった場合は基本的にこのデータセットでテストする。
+
 データ配置: `data/beir/scifact/`（`data/README.md` 参照）
 
 ```bash
 export PYTHONUTF8=1 RURI_DEVICE=cuda LLAMA_SERVER_TIMEOUT_SECONDS=180
 
 # 評価用スクリプト例（50 文書サブセット + 10 クエリ）
+# もっと大量にテストしても良い
 uv run python scripts/run_production_scifact_eval.py \
   --helix-url http://localhost:6969 \
   --db /tmp/prod_scifact_helix.sqlite3 \
