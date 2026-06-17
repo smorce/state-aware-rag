@@ -428,6 +428,7 @@ class SQLiteRagStore:
         ev = Evidence(
             id=new_id("ev"),
             chunk_id=chunk_id,
+            working_memory_id=working_memory_id,
             round=round_number,
             query=query,
             body_excerpt=body_excerpt,
@@ -1023,6 +1024,7 @@ class SQLiteRagStore:
         return Evidence(
             id=str(row["id"]),
             chunk_id=str(row["chunk_id"]),
+            working_memory_id=str(row["working_memory_id"]),
             round=int(row["round"]),
             query=str(row["query"]),
             body_excerpt=str(row["body_excerpt"]),

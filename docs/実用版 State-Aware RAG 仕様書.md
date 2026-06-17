@@ -37,7 +37,19 @@
 | Bosun           | 検索候補の関連性、メモの価値、重複、矛盾を採点         |
 | Orchestrator    | ループ制御、停止条件、スコア管理、ログ保存           |
 | Embedding Model | 文書チャンクとメモのベクトル化                 |
-| Working Memory  | 質問ごとの作業用メモ。HelixDB上で管理する        |
+| Working Memory  | 質問ごとの作業用メモ。本番 backend では HelixDB を正とする        |
+| SQLite mirror   | ID 復元、型復元、Chunk 原文 `body` 保持。Helix backend でも常に併用する |
+
+### 2.2 ストレージ構成（デュアルストレージ）
+
+CLI の既定 backend は `helix` である。このときの正（source of truth）は HelixDB 上のグラフである。
+
+- HelixDB が担うもの: `Document` / `Chunk` / `Entity` / `Question` / `WorkingMemory` / `MemoryNote` / `Evidence` / `SearchRound` と、検索・グラフ走査に使うエッジ
+- SQLite mirror が担うもの: Python 側の型復元、ID 参照、Chunk の表示用原文 `body`（Helix 側 `body` は全文検索向け正規化文字列を格納する）
+
+`--backend helix` では WorkingMemory および質問セッション関連データは HelixDB 上で管理する。SQLite mirror は上記の補助役に限定し、グラフ探索ロジックの正にはしない。
+
+開発検証用に `--backend sqlite` を指定した場合は HelixDB を使わず、SQLite mirror だけで同等のオーケストレーション・フローを検証できる。本番想定の構成ではない。
 
 ---
 
@@ -486,8 +498,11 @@ Note B:
 判定:
 
 ```text
-duplicate_score >= 0.80 の場合、新規メモとして追加しない。
-既存メモの source_count と evidence だけを更新する。
+duplicate_score >= 0.80 の場合、active な新規メモとして追加しない。
+既存メモ（canonical）の source_count と evidence を更新する。
+監査・グラフ追跡用に、status=duplicate の shadow MemoryNote を1件作り、
+DUPLICATE_OF エッジで canonical メモへつなげてよい。
+shadow メモは最終回答の active メモ一覧には含めない。
 ```
 
 ### 6.4 矛盾検出
@@ -659,6 +674,7 @@ max_sub_questions_per_round = 3
 
 初期実装では、Monte Carlo Tree Search を本体ループには入れない。
 ただし、後から差し替えられるように、検索戦略としてインターフェースを分離する。
+現行 Python 実装の `MctsSearchStrategy` は §9.6 のスタブにとどめ、§9.7 の本格 MCTS は将来実装とする。
 
 ### 9.2 SearchStrategy インターフェース
 
@@ -718,9 +734,26 @@ class SocraticSearchStrategy implements SearchStrategy {
 }
 ```
 
-### 9.6 将来実装
+### 9.6 現行実装（スタブ）
 
-将来、`MctsSearchStrategy` を追加する。現行 Python 実装では差し替え口と軽いスタブだけを置き、本格的な木探索は今回の実装範囲に含めない。
+現行 Python 実装では `MctsSearchStrategy` を差し替え口として置くが、Monte Carlo Tree Search 本体は入れない。
+
+- `SocraticSearchStrategy` を継承する
+- `score_action` で diversity と cost の微調整のみ行う
+- `proposeNextActions` と `selectActions` の木探索化は行わない
+- §9.7 の報酬関数は適用しない
+
+```typescript
+class MctsSearchStrategy extends SocraticSearchStrategy {
+  scoreAction(action: SearchAction, state: SearchState): number {
+    // Socratic の score に diversity / cost の微調整だけ足す
+  }
+}
+```
+
+### 9.7 将来実装（本格 MCTS）
+
+将来、本格的な `MctsSearchStrategy` を追加する場合のインターフェース案と報酬設計案である。§9.6 のスタブとは別物とする。
 
 ```typescript
 class MctsSearchStrategy implements SearchStrategy {
@@ -738,9 +771,7 @@ class MctsSearchStrategy implements SearchStrategy {
 }
 ```
 
-### 9.7 MCTS用の評価関数案
-
-MCTSを後から入れる場合、報酬は次のようにする。
+本格 MCTS を入れる場合、報酬は次のようにする。
 
 ```text
 reward =
@@ -813,6 +844,7 @@ function answer(question):
                 if duplicate_score >= 0.80:
                     link_evidence_to_existing_note(existing_note, note.evidence)
                     increment_source_count(existing_note)
+                    optionally_create_duplicate_shadow_note(existing_note, note)
                     duplicate = true
                     break
 
@@ -1102,7 +1134,7 @@ WorkingMemory 内の active な MemoryNote と Evidence 情報だけを渡す。
 - Document 内の前後 Chunk 補完
 - Helix backend でのグラフ探索候補発見（§5.3.1。SQLite mirror は原文表示のみ）
 - SearchStrategy インターフェース
-- MctsSearchStrategy
+- MctsSearchStrategy（`score_action` 微調整のみのスタブ。木探索と §9.7 報酬は未実装）
 - 最終回答生成
 ```
 
@@ -1133,13 +1165,13 @@ WorkingMemory 内の active な MemoryNote と Evidence 情報だけを渡す。
 
 1. 検索結果をそのまま最終回答に渡さない。
 2. 検索結果は、必ず Evidence と MemoryNote に変換する。
-3. WorkingMemory は HelixDB 上で管理する。
+3. 本番 backend（`--backend helix`）では WorkingMemory および質問セッション関連グラフを HelixDB 上で管理する。SQLite mirror は ID 復元・型復元・Chunk 原文保持に使い、Helix backend でも常に併用する。`--backend sqlite` は Helix なしの開発検証用である。
 4. Bosunは判定だけに使う。
 5. 大きな言語モデルは、計画、メモ化、回答生成に使う。
 6. 停止条件はできるだけ機械的にする。
-7. MCTSは初期実装に入れず、検索戦略として後から差し替えられるようにする。
+7. MCTS 本体は初期実装に入れない。`MctsSearchStrategy` は `score_action` 微調整のみのスタブとし、木探索と §9.7 の報酬関数は将来実装とする。
 8. 矛盾は消さずに、CONFLICTS_WITH として残す。
-9. 重複は新規メモにせず、既存メモの根拠を増やす。
+9. 重複は active な新規メモにせず、既存メモの根拠を増やす。監査用の shadow MemoryNote（`status=duplicate`）と `DUPLICATE_OF` エッジを記録してもよい。
 10. 最終回答は WorkingMemory だけを使う。
 11. Helix backend ではグラフ探索候補の発見を HelixDB 上で行い、SQLite mirror に探索ロジックを委譲しない（mirror は原文表示と型復元に限定する）。
 

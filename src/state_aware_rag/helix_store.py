@@ -560,7 +560,7 @@ class HelixBackedRagStore(SQLiteRagStore):
             {
                 "id": ev.id,
                 "chunk_id": ev.chunk_id,
-                "working_memory_id": self._working_memory_id_for_evidence(ev.id),
+                "working_memory_id": ev.working_memory_id,
                 "round": ev.round,
                 "query": ev.query,
                 "body_excerpt": ev.body_excerpt,

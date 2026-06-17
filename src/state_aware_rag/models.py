@@ -105,6 +105,7 @@ class WorkingMemory:
 class Evidence:
     id: str
     chunk_id: str
+    working_memory_id: str
     round: int
     query: str
     body_excerpt: str
