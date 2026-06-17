@@ -1,0 +1,41 @@
+[project]
+name = "state-aware-rag"
+version = "0.1.0"
+description = "Practical State-Aware RAG implementation with working memory, evidence, and iterative retrieval."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "budoux>=0.8.4",
+    "openai>=1.0",
+    "sentence-transformers>=3.0",
+    "torch",
+]
+
+[project.optional-dependencies]
+bosun-native = [
+    "transformers",
+    "peft",
+]
+ruri = [
+    "sentence-transformers>=3.0",
+    "torch",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+state-aware-rag = "state_aware_rag.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

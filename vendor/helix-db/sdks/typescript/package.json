@@ -1,0 +1,70 @@
+{
+  "name": "@helix-db/helix-db",
+  "version": "2.0.3",
+  "description": "TypeScript library for working with  HelixDB",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "author": "HelixDB",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/HelixDB/helix-db/tree/main/sdks/typescript",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HelixDB/helix-db.git",
+    "directory": "sdks/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/helixdb/helix-db/issues"
+  },
+  "keywords": [
+    "helix",
+    "helixdb",
+    "graph-database",
+    "vector-database",
+    "query-builder",
+    "dsl",
+    "typescript"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test:type": "tsc -p tsconfig.json --noEmit",
+    "test:unit": "tsc -p tsconfig.json && node dist-dev/test/basic.test.js && node dist-dev/test/client.test.js && node dist-dev/scripts/nested-dsl.test.js",
+    "test": "npm run test:type && npm run test:unit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "parity:generate:rust": "cargo run --manifest-path ../rust/Cargo.toml --example generate_parity_fixtures -- ../tests/parity/generated/rust",
+    "parity:generate:ts": "tsc -p tsconfig.json && node dist-dev/scripts/parity/generate-fixtures.js",
+    "parity:generate:go": "cd ../go && go run ./cmd/generate-parity-fixtures ../tests/parity/generated/go",
+    "parity:generate": "npm run parity:generate:rust && npm run parity:generate:ts && npm run parity:generate:go",
+    "parity:compare-json": "tsc -p tsconfig.json && node dist-dev/scripts/parity/compare-json.js",
+    "parity:helix": "tsc -p tsconfig.json && node dist-dev/scripts/parity/run-helix.js",
+    "test:parity": "npm run parity:generate && npm run parity:compare-json && npm run parity:helix",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm test && npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "eslint": "^10.4.0",
+    "prettier": "^3.8.3",
+    "typescript": "^5.4.0",
+    "typescript-eslint": "^8.59.3"
+  }
+}

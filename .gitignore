@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv.windows.bak/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ローカルツール・一時ファイル
+.tools/
+tmp_helix_mirror.sqlite3
+*.sqlite3
+
+# Helix ローカル状態
+helix_project/.helix/
+
+# データセットの重複アーカイブ（展開済み corpus は data/beir/ に保持）
+data/scifact.zip

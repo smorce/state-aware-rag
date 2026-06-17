@@ -1,0 +1,93 @@
+name: SDK DSL Parity
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'sdks/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/parity_tests.yml'
+  push:
+    branches: [main, dev]
+    paths:
+      - 'sdks/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/parity_tests.yml'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest          # Docker daemon preinstalled; required for the runtime phase
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Rust (generate Rust fixtures) ---
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') || 'fallback' }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # --- Node (all phases) ---
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+
+      # --- Go (generate Go fixtures) ---
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache-dependency-path: sdks/go/go.mod
+
+      # --- helix CLI (released binary) ---
+      # install.sh lives under helix-cli/ on main (not the repo root); installs to ~/.local/bin
+      # and is non-interactive on Linux (the Docker Desktop prompt is macOS-only).
+      - name: Install helix CLI
+        working-directory: .
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/HelixDB/helix-db/main/helix-cli/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain
+        run: |
+          helix --version
+          docker --version
+
+      - name: Install npm deps
+        run: npm ci
+
+      - name: Check Go formatting
+        working-directory: sdks/go
+        run: test -z "$(gofmt -l .)"
+
+      - name: Test Go SDK
+        working-directory: sdks/go
+        run: go test ./...
+
+      - name: Run parity suite
+        run: npm run test:parity
+
+      - name: Upload parity artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-output
+          path: |
+            sdks/tests/parity/generated/**
+            sdks/tests/parity/results/**
+          if-no-files-found: ignore

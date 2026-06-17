@@ -1,0 +1,191 @@
+package helix
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sync"
+)
+
+type ErrorKind string
+
+const (
+	ErrorNetwork       ErrorKind = "Network"
+	ErrorRemote        ErrorKind = "Remote"
+	ErrorSerialization ErrorKind = "Serialization"
+	ErrorInvalidURL    ErrorKind = "InvalidUrl"
+)
+
+var ErrConflict = errors.New("helix: conflict")
+
+type HelixError struct {
+	Kind       ErrorKind
+	Details    string
+	StatusCode int
+	Err        error
+}
+
+func (e *HelixError) Error() string {
+	if e.Details != "" {
+		return fmt.Sprintf("helix %s error: %s", e.Kind, e.Details)
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("helix %s error: %v", e.Kind, e.Err)
+	}
+	return "helix " + string(e.Kind) + " error"
+}
+
+func (e *HelixError) Unwrap() error { return e.Err }
+
+func IsConflict(err error) bool {
+	var helixErr *HelixError
+	return errors.Is(err, ErrConflict) || errors.As(err, &helixErr) && helixErr.Kind == ErrorRemote && helixErr.StatusCode == http.StatusConflict
+}
+
+type Client struct {
+	baseURL    *url.URL
+	httpClient *http.Client
+	apiKeyMu   sync.RWMutex
+	apiKey     string
+}
+
+type ClientOption func(*Client)
+
+func WithHTTPClient(httpClient *http.Client) ClientOption {
+	return func(c *Client) {
+		if httpClient != nil {
+			c.httpClient = httpClient
+		}
+	}
+}
+
+func WithAPIKey(apiKey string) ClientOption {
+	return func(c *Client) { c.setAPIKey(apiKey) }
+}
+
+func NewClient(baseURL string, opts ...ClientOption) (*Client, error) {
+	if baseURL == "" {
+		baseURL = "http://localhost:6969"
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		if err == nil {
+			err = fmt.Errorf("missing scheme or host")
+		}
+		return nil, &HelixError{Kind: ErrorInvalidURL, Err: err, Details: err.Error()}
+	}
+	client := &Client{baseURL: parsed, httpClient: http.DefaultClient}
+	for _, opt := range opts {
+		opt(client)
+	}
+	return client, nil
+}
+
+func (c *Client) WithAPIKey(apiKey string) *Client { c.setAPIKey(apiKey); return c }
+func (c *Client) ClearAPIKey() *Client             { c.setAPIKey(""); return c }
+func (c *Client) BaseURL() string {
+	if c == nil || c.baseURL == nil {
+		return ""
+	}
+	return c.baseURL.String()
+}
+
+func (c *Client) setAPIKey(apiKey string) {
+	if c == nil {
+		return
+	}
+	c.apiKeyMu.Lock()
+	c.apiKey = apiKey
+	c.apiKeyMu.Unlock()
+}
+
+func (c *Client) getAPIKey() string {
+	c.apiKeyMu.RLock()
+	apiKey := c.apiKey
+	c.apiKeyMu.RUnlock()
+	return apiKey
+}
+
+type execOptions struct {
+	writerOnly      bool
+	warmOnly        bool
+	awaitDurability *bool
+}
+
+type ExecOption func(*execOptions)
+
+func WriterOnly() ExecOption { return func(o *execOptions) { o.writerOnly = true } }
+func WarmOnly() ExecOption   { return func(o *execOptions) { o.warmOnly = true } }
+func AwaitDurability(should bool) ExecOption {
+	return func(o *execOptions) { o.awaitDurability = &should }
+}
+
+func (c *Client) Exec(ctx context.Context, req Request, out any, opts ...ExecOption) error {
+	if c == nil || c.baseURL == nil {
+		return &HelixError{Kind: ErrorInvalidURL, Details: "nil client"}
+	}
+	body, err := MarshalRequest(req)
+	if err != nil {
+		return &HelixError{Kind: ErrorSerialization, Err: err, Details: err.Error()}
+	}
+	endpoint := c.baseURL.ResolveReference(&url.URL{Path: "/v1/query"})
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(body))
+	if err != nil {
+		return &HelixError{Kind: ErrorInvalidURL, Err: err, Details: err.Error()}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if apiKey := c.getAPIKey(); apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	options := execOptions{}
+	for _, opt := range opts {
+		opt(&options)
+	}
+	if options.writerOnly {
+		httpReq.Header.Set("x-helix-require-writer", "true")
+	}
+	if options.warmOnly {
+		httpReq.Header.Set("x-helix-warm", "true")
+	}
+	if options.awaitDurability != nil {
+		if *options.awaitDurability {
+			httpReq.Header.Set("x-helix-await-durable", "true")
+		} else {
+			httpReq.Header.Set("x-helix-await-durable", "false")
+		}
+	}
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return &HelixError{Kind: ErrorNetwork, Err: err, Details: err.Error()}
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return &HelixError{Kind: ErrorNetwork, Err: err, Details: err.Error()}
+	}
+	if resp.StatusCode != http.StatusOK {
+		details := string(respBody)
+		if details == "" {
+			details = resp.Status
+		}
+		remoteErr := &HelixError{Kind: ErrorRemote, Details: details, StatusCode: resp.StatusCode}
+		if resp.StatusCode == http.StatusConflict {
+			remoteErr.Err = ErrConflict
+		}
+		return remoteErr
+	}
+	if out == nil || len(respBody) == 0 {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(respBody))
+	decoder.UseNumber()
+	if err := decoder.Decode(out); err != nil {
+		return &HelixError{Kind: ErrorSerialization, Err: err, Details: err.Error()}
+	}
+	return nil
+}
