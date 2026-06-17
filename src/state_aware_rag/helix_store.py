@@ -232,7 +232,7 @@ class HelixBackedRagStore(SQLiteRagStore):
         graph_query = "graph:" + ",".join(names)
         seed_ids: list[str] = []
         for name in names:
-            entity = self.find_entity_by_name(name)
+            entity = self.find_entity_seed(name)
             if entity is not None:
                 seed_ids.append(entity.id)
         expanded_ids = self.related_entity_ids(seed_ids, max_hops=2)
@@ -243,7 +243,7 @@ class HelixBackedRagStore(SQLiteRagStore):
         candidates: list[RetrievalCandidate] = []
         seen: set[str] = set()
         for entity_name in entities:
-            entity = self.find_entity_by_name(entity_name)
+            entity = self.find_entity_seed(entity_name)
             label = entity.entity_type.value if entity is not None else "Other"
             canonical_name = entity.canonical_name if entity is not None else entity_name
             response = self._query_with_values(

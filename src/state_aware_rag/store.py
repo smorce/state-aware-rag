@@ -8,7 +8,7 @@ from typing import Any
 from state_aware_rag.chunking import Chunker, build_chunker
 from state_aware_rag.config import RagConfig
 from state_aware_rag.embedding import Embedder, build_embedder
-from state_aware_rag.extraction import EntityResolver, build_entity_extractor, normalize_entity_name
+from state_aware_rag.extraction import EntityResolver, build_entity_extractor, find_entity_seed_match, normalize_entity_name
 from state_aware_rag.models import (
     Chunk,
     Document,
@@ -705,6 +705,16 @@ class SQLiteRagStore:
             return self._row_to_entity(row)
         return self.find_entity_by_alias(normalized)
 
+    def find_entity_seed(self, name: str) -> Entity | None:
+        """グラフ検索 seed 用: 完全一致のあと部分一致・名寄せ・embedding で既存 Entity を探す。"""
+        seed = name.strip()
+        if not seed:
+            return None
+        exact = self.find_entity_by_name(seed)
+        if exact is not None:
+            return exact
+        return find_entity_seed_match(seed, self.list_entities(), self.embedder)
+
     def resolve_entity_ref(self, entity_ref: str) -> str:
         if self.conn.execute("SELECT 1 FROM entities WHERE id = ?", (entity_ref,)).fetchone():
             return entity_ref
@@ -810,11 +820,9 @@ class SQLiteRagStore:
             return []
         entity_ids: list[str] = []
         for name in entities:
-            entity = self.find_entity_by_name(name)
+            entity = self.find_entity_seed(name)
             if entity is not None:
                 entity_ids.append(entity.id)
-            else:
-                entity_ids.append(self.add_entity(name))
         expanded_ids = self.related_entity_ids(entity_ids, max_hops=2)
         if not expanded_ids:
             return []

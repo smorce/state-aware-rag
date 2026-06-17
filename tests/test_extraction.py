@@ -270,3 +270,24 @@ def test_ingest_with_scripted_extractor_persists_entities_and_relations(
     }
     assert len(relations) == 1
     assert relations[0].relation_type == "WORKS_AT"
+
+
+def test_find_entity_seed_match_partial_name(tmp_path: Path) -> None:
+    store = SQLiteRagStore(tmp_path / "rag.sqlite3", embedder=HashedEmbedder())
+    store.add_entity("1000 Genomes Project")
+
+    matched = store.find_entity_seed("1000 Genomes")
+
+    assert matched is not None
+    assert matched.canonical_name == "1000 Genomes Project"
+
+
+def test_find_entity_seed_match_alias_similarity(tmp_path: Path) -> None:
+    store = SQLiteRagStore(tmp_path / "rag.sqlite3", embedder=HashedEmbedder())
+    entity_id = store.add_entity("Rare variant")
+    store.add_entity_alias(entity_id, "rare variants")
+
+    matched = store.find_entity_seed("Rare variants")
+
+    assert matched is not None
+    assert matched.id == entity_id

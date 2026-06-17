@@ -97,7 +97,7 @@ def main() -> int:
                 title=row["title"],
                 body=body,
                 source_uri=f"scifact:{doc_id_value}",
-                extract_entities=False,
+                extract_entities=True,
             )
             if index % 10 == 0:
                 print(f"ingested {index}/{len(ingest_ids)} elapsed={time.time() - t0:.0f}s")

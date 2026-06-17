@@ -25,6 +25,9 @@ CORP_SUFFIX_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 JACCARD_MATCH_THRESHOLD = 0.85
 EDIT_DISTANCE_MATCH_THRESHOLD = 0.90
 EMBEDDING_MATCH_THRESHOLD = 0.92
+SEED_PARTIAL_MIN_LEN = 4
+SEED_NAME_SIMILARITY_THRESHOLD = 0.65
+SEED_EMBEDDING_MATCH_THRESHOLD = 0.85
 
 
 class EntityExtractor(Protocol):
@@ -71,6 +74,60 @@ def _levenshtein_ratio(left: str, right: str) -> float:
         previous = current
     distance = previous[-1]
     return 1.0 - distance / max(len(left), len(right))
+
+
+def score_entity_name_match(left: str, right: str) -> float:
+    """2つのエンティティ名の類似度（0〜1）。"""
+    return _name_similarity(left, right)
+
+
+def partial_entity_name_match(left: str, right: str, *, min_len: int = SEED_PARTIAL_MIN_LEN) -> bool:
+    """正規化名の部分一致（双方向）。"""
+    left_norm = normalize_entity_name(left)
+    right_norm = normalize_entity_name(right)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    shorter, longer = (left_norm, right_norm) if len(left_norm) <= len(right_norm) else (right_norm, left_norm)
+    if len(shorter) < min_len:
+        return False
+    return shorter in longer
+
+
+def find_entity_seed_match(name: str, entities: list[Entity], embedder: Embedder) -> Entity | None:
+    """LLM seed を既存エンティティへファジーマッチする（部分一致・名寄せ・embedding）。"""
+    seed = name.strip()
+    if not seed or not entities:
+        return None
+
+    best: Entity | None = None
+    best_score = 0.0
+    seed_embedding: list[float] | None = None
+
+    for entity in entities:
+        for candidate_name in (entity.canonical_name, *entity.aliases):
+            if partial_entity_name_match(seed, candidate_name):
+                score = 0.95
+            else:
+                score = score_entity_name_match(seed, candidate_name)
+                if score < SEED_NAME_SIMILARITY_THRESHOLD:
+                    continue
+            if score > best_score:
+                best = entity
+                best_score = score
+
+        if best_score >= 0.95:
+            continue
+
+        if seed_embedding is None:
+            seed_embedding = embedder.embed_claim(seed)
+        embedding_score = cosine_similarity(seed_embedding, entity.embedding)
+        if embedding_score >= SEED_EMBEDDING_MATCH_THRESHOLD and embedding_score > best_score:
+            best = entity
+            best_score = embedding_score
+
+    return best
 
 
 def _name_similarity(left: str, right: str) -> float:

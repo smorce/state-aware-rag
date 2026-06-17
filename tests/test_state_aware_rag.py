@@ -104,6 +104,24 @@ def test_graph_search_expands_from_memory_entities_and_evidence_neighbors(tmp_pa
     assert "HelixDB" in candidates[0].body
 
 
+def test_graph_search_resolves_fuzzy_seed_entity(tmp_path: Path) -> None:
+    rag = make_rag(tmp_path)
+    doc = rag.ingest_document(
+        title="Genomes",
+        body="The 1000 Genomes Project maps rare variants across populations.",
+        source_uri="memory://genomes",
+        chunk_size=80,
+        extract_entities=True,
+    )
+    wm = rag.store.create_working_memory("What does the 1000 Genomes Project do?")
+    rag.store.link_chunk_entity(doc.chunks[0].id, "1000 Genomes Project")
+
+    candidates = rag.retriever.graph_search(["1000 Genomes"], wm.id, top_k=10)
+
+    assert candidates
+    assert any("1000 Genomes Project" in candidate.body for candidate in candidates)
+
+
 def test_select_actions_penalizes_repeated_queries(tmp_path: Path) -> None:
     strategy = SocraticSearchStrategy(LocalHeuristicLLM(), RagConfig())
     state = SearchState(
