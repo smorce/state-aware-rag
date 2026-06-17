@@ -6,7 +6,7 @@ from typing import Any
 from state_aware_rag.embedding import HashedEmbedder
 from state_aware_rag.helix import HelixTypeScriptQueryBuilder
 from state_aware_rag.helix_store import HelixBackedRagStore
-from state_aware_rag.models import RetrievalMethod, RoundLog
+from state_aware_rag.models import NoteStatus, RetrievalMethod, RoundLog
 
 
 class FakeHelixClient:
@@ -190,3 +190,80 @@ def test_helix_backed_store_uses_helix_for_graph_search(tmp_path: Path) -> None:
     assert graph[0].chunk_id == "chunk_3"
     sent = "\n".join(str(request) for request in fake.requests)
     assert "MENTIONS" in sent
+
+
+def test_helix_backed_store_writes_duplicate_of_edge(tmp_path: Path) -> None:
+    fake = FakeHelixClient()
+    store = HelixBackedRagStore(tmp_path / "mirror.sqlite3", http_client=fake, embedder=HashedEmbedder())
+    doc = store.ingest_document(title="Doc", body="Working memory stores facts.", source_uri="memory://doc")
+    wm = store.create_working_memory("What does working memory store?")
+    evidence = store.create_evidence(
+        wm.id,
+        doc.chunks[0].id,
+        round_number=1,
+        query="working memory",
+        body_excerpt=doc.chunks[0].body,
+        retrieval_method=RetrievalMethod.TEXT,
+        raw_rank=1,
+        relevance_score=0.9,
+        memory_value_score=0.9,
+        accepted=True,
+        source_uri="memory://doc",
+    )
+    canonical = store.create_memory_note(wm.id, "Working memory stores facts.", "fact", 0.9, [evidence.id], 1)
+    duplicate = store.create_memory_note(
+        wm.id,
+        "Working memory stores facts.",
+        "fact",
+        0.8,
+        [evidence.id],
+        1,
+        status=NoteStatus.DUPLICATE,
+    )
+
+    store.add_duplicate_edge(duplicate.id, canonical.id, 0.95)
+
+    sent = "\n".join(str(request) for request in fake.requests)
+    assert "DUPLICATE_OF" in sent
+
+
+def test_helix_graph_search_includes_neighbor_chunks(tmp_path: Path) -> None:
+    fake = FakeHelixClient()
+    store = HelixBackedRagStore(tmp_path / "mirror.sqlite3", http_client=fake, embedder=HashedEmbedder())
+    doc = store.ingest_document(
+        title="Doc",
+        body=(
+            "Alpha introduces working memory. "
+            "Beta explains that evidence points to chunks. "
+            "Gamma covers final answers."
+        ),
+        source_uri="memory://neighbors",
+        chunk_size=35,
+        overlap=0,
+        extract_entities=False,
+    )
+    wm = store.create_working_memory("How does evidence connect?")
+    evidence = store.create_evidence(
+        wm.id,
+        doc.chunks[1].id,
+        round_number=1,
+        query="evidence chunks",
+        body_excerpt=doc.chunks[1].body,
+        retrieval_method=RetrievalMethod.TEXT,
+        raw_rank=1,
+        relevance_score=0.9,
+        memory_value_score=0.9,
+        accepted=True,
+        source_uri="memory://neighbors",
+    )
+    store.create_memory_note(wm.id, "Evidence points to chunks.", "fact", 0.9, [evidence.id], 1)
+
+    graph = store.helix_graph_search([], wm.id, 10)
+    neighbor_candidates = [
+        candidate
+        for candidate in graph
+        if candidate.graph_reason == "採用済み Evidence と同じ Document の前後 Chunk"
+    ]
+
+    assert neighbor_candidates
+    assert {candidate.chunk_id for candidate in neighbor_candidates} & {chunk.id for chunk in doc.chunks}

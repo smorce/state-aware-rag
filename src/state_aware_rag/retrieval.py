@@ -35,6 +35,7 @@ class Retriever:
                     raw_rank=rank,
                     source_uri=chunk.source_uri,
                     retrieval_methods=(RetrievalMethod.VECTOR,),
+                    vector_rank=rank,
                 )
             )
         return candidates
@@ -57,6 +58,7 @@ class Retriever:
                     raw_rank=rank,
                     source_uri=chunk.source_uri,
                     retrieval_methods=(RetrievalMethod.TEXT,),
+                    text_rank=rank,
                 )
             )
         return candidates
@@ -100,6 +102,14 @@ class Retriever:
             methods = tuple(dict.fromkeys(item.method for item in group))
             best = max(group, key=lambda item: item.raw_score)
             method = RetrievalMethod.HYBRID if len(methods) > 1 else best.method
+            vector_rank = min(
+                (item.vector_rank if item.vector_rank is not None else item.raw_rank for item in group if item.method == RetrievalMethod.VECTOR),
+                default=None,
+            )
+            text_rank = min(
+                (item.text_rank if item.text_rank is not None else item.raw_rank for item in group if item.method == RetrievalMethod.TEXT),
+                default=None,
+            )
             merged.append(
                 RetrievalCandidate(
                     chunk_id=chunk_id,
@@ -110,6 +120,8 @@ class Retriever:
                     source_uri=best.source_uri,
                     graph_reason=next((item.graph_reason for item in group if item.graph_reason), None),
                     retrieval_methods=methods,
+                    vector_rank=vector_rank,
+                    text_rank=text_rank,
                 )
             )
         merged.sort(key=lambda item: (len(item.retrieval_methods), item.raw_score), reverse=True)

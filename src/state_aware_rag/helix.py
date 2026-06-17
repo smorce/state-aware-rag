@@ -45,6 +45,15 @@ class HelixHttpClient:
         return headers
 
 
+def helix_startup_hint() -> str:
+    return (
+        "Start HelixDB before using the default backend. "
+        "Windows: .\\.tools\\helix.exe start dev --port 6969 --persist. "
+        "Linux/macOS: cd helix_project && ../.tools/helix start --port 6969 dev. "
+        "Use --backend sqlite for local development without HelixDB."
+    )
+
+
 class HelixTypeScriptQueryBuilder:
     """TypeScript SDK を Python から sidecar として呼び、動的クエリ JSON を作る。"""
 

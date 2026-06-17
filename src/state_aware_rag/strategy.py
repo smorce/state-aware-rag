@@ -15,7 +15,7 @@ class SearchStrategy(Protocol):
     def score_action(self, action: SearchAction, state: SearchState) -> float:
         ...
 
-    def select_actions(self, actions: list[SearchAction], budget: SearchBudget) -> list[SearchAction]:
+    def select_actions(self, actions: list[SearchAction], budget: SearchBudget, state: SearchState) -> list[SearchAction]:
         ...
 
 
@@ -41,7 +41,7 @@ class SocraticSearchStrategy:
                     vector_query=str(item["vector_query"]),
                     text_query=str(item["text_query"]),
                     graph_seed_entities=list(item.get("graph_seed_entities", [])),
-                    expected_gain=1.0,
+                    expected_gain=float(item.get("priority", 1)),
                     cost_estimate=1.0,
                     priority=int(item.get("priority", 1)),
                 )
@@ -53,8 +53,8 @@ class SocraticSearchStrategy:
         open_question_bonus = max((overlap_score(action.sub_question, item.question) for item in state.open_questions), default=0.2)
         return action.priority + open_question_bonus + action.expected_gain - previous_penalty - action.cost_estimate * 0.05
 
-    def select_actions(self, actions: list[SearchAction], budget: SearchBudget) -> list[SearchAction]:
-        return sorted(actions, key=lambda action: action.expected_gain, reverse=True)[: budget.max_actions]
+    def select_actions(self, actions: list[SearchAction], budget: SearchBudget, state: SearchState) -> list[SearchAction]:
+        return sorted(actions, key=lambda action: self.score_action(action, state), reverse=True)[: budget.max_actions]
 
 
 class MctsSearchStrategy(SocraticSearchStrategy):
@@ -63,4 +63,3 @@ class MctsSearchStrategy(SocraticSearchStrategy):
         diversity = 1.0 - max((overlap_score(action.text_query, query) for query in state.previous_queries), default=0.0)
         evidence_cost = min(1.0, action.cost_estimate / 10.0)
         return base + 0.10 * diversity - 0.10 * evidence_cost
-

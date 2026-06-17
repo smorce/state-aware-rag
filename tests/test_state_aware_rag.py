@@ -3,8 +3,10 @@ from pathlib import Path
 from state_aware_rag import StateAwareRag
 from state_aware_rag.config import RagConfig
 from state_aware_rag.embedding import HashedEmbedder
-from state_aware_rag.models import RetrievalMethod, WorkingMemoryStatus
+from state_aware_rag.llm import LocalHeuristicLLM
+from state_aware_rag.models import OpenQuestion, RetrievalMethod, SearchAction, SearchBudget, SearchState, WorkingMemoryStatus
 from state_aware_rag.store import SQLiteRagStore
+from state_aware_rag.strategy import SocraticSearchStrategy
 
 
 def make_rag(tmp_path: Path) -> StateAwareRag:
@@ -89,3 +91,135 @@ def test_graph_search_expands_from_memory_entities_and_evidence_neighbors(tmp_pa
     assert candidates[0].method == RetrievalMethod.GRAPH
     assert "HelixDB" in candidates[0].body
 
+
+def test_select_actions_penalizes_repeated_queries(tmp_path: Path) -> None:
+    strategy = SocraticSearchStrategy(LocalHeuristicLLM(), RagConfig())
+    state = SearchState(
+        question="What does working memory store?",
+        working_memory_id="wm_1",
+        round=1,
+        notes=[],
+        open_questions=[OpenQuestion(question="What facts are stored?", reason="missing")],
+        previous_queries=["working memory duplicate query"],
+        previous_evidence_ids=[],
+    )
+    repeated = SearchAction(
+        action_id="act_repeated",
+        sub_question="What facts are stored?",
+        vector_query="working memory duplicate query",
+        text_query="working memory duplicate query",
+        graph_seed_entities=[],
+        expected_gain=1.0,
+        cost_estimate=1.0,
+        priority=1,
+    )
+    fresh = SearchAction(
+        action_id="act_fresh",
+        sub_question="What facts are stored?",
+        vector_query="atomic facts storage",
+        text_query="atomic facts storage",
+        graph_seed_entities=[],
+        expected_gain=1.0,
+        cost_estimate=1.0,
+        priority=1,
+    )
+
+    selected = strategy.select_actions([repeated, fresh], SearchBudget(max_actions=1), state)
+
+    assert selected == [fresh]
+
+
+def test_stops_when_open_questions_resolved(tmp_path: Path) -> None:
+    rag = make_rag(tmp_path)
+
+    status = rag._stop_status(
+        1,
+        no_new_note_rounds=0,
+        low_gain_rounds=0,
+        open_question_count=0,
+        active_note_count=1,
+    )
+
+    assert status == WorkingMemoryStatus.COMPLETED
+
+
+def test_resolve_open_question_matches_claim(tmp_path: Path) -> None:
+    rag = make_rag(tmp_path)
+    wm = rag.store.create_working_memory("What does working memory store?")
+    rag.store.add_open_question(wm.id, "What does working memory store?", "missing")
+    rag.store.add_open_question(wm.id, "Who owns the system?", "missing")
+
+    rag._resolve_open_questions_for_claim(wm.id, "Working memory stores concise atomic facts.")
+
+    remaining = rag.store.list_open_questions(wm.id)
+    assert remaining == [{"question": "Who owns the system?", "reason": "missing"}]
+
+
+def test_duplicate_creates_duplicate_shadow_note_and_edge(tmp_path: Path) -> None:
+    rag = make_rag(tmp_path)
+    doc = rag.ingest_document(
+        title="Memory",
+        body="Working memory stores concise atomic facts. Working memory stores facts for each question.",
+        source_uri="memory://dup",
+        chunk_size=80,
+    )
+    wm = rag.store.create_working_memory("What does working memory store?")
+    first = rag.store.create_evidence(
+        wm.id,
+        doc.chunks[0].id,
+        round_number=1,
+        query="working memory",
+        body_excerpt=doc.chunks[0].body,
+        retrieval_method=RetrievalMethod.TEXT,
+        raw_rank=1,
+        relevance_score=0.9,
+        memory_value_score=0.8,
+        accepted=True,
+        source_uri="memory://dup",
+    )
+    second = rag.store.create_evidence(
+        wm.id,
+        doc.chunks[0].id,
+        round_number=2,
+        query="working memory facts",
+        body_excerpt=doc.chunks[0].body,
+        retrieval_method=RetrievalMethod.TEXT,
+        raw_rank=1,
+        relevance_score=0.7,
+        memory_value_score=0.6,
+        accepted=True,
+        source_uri="memory://dup",
+    )
+    canonical = rag.store.create_memory_note(
+        wm.id,
+        "Working memory stores concise atomic facts.",
+        "fact",
+        0.9,
+        [first.id],
+        1,
+    )
+
+    accepted_count, duplicate_count, conflict_count = rag._save_notes(
+        wm.id,
+        2,
+        {
+            "notes": [
+                {
+                    "claim": "Working memory stores concise atomic facts.",
+                    "note_type": "fact",
+                    "supported_by_evidence_ids": [second.id],
+                    "confidence": 0.8,
+                }
+            ]
+        },
+    )
+
+    assert (accepted_count, duplicate_count, conflict_count) == (0, 1, 0)
+    assert len(rag.store.list_memory_notes(wm.id)) == 1
+    all_notes = rag.store.list_memory_notes(wm.id, active_only=False)
+    duplicate_notes = [note for note in all_notes if note.status.value == "duplicate"]
+    assert len(duplicate_notes) == 1
+    edge = rag.store.conn.execute("SELECT * FROM duplicate_edges").fetchone()
+    assert edge is not None
+    assert edge["duplicate_note_id"] == duplicate_notes[0].id
+    assert edge["canonical_note_id"] == canonical.id

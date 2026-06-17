@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from state_aware_rag.bosun import NativeBosunXSScorer, RuleBosunScorer
 from state_aware_rag.config import RagConfig
+from state_aware_rag.helix import helix_startup_hint
 from state_aware_rag.helix_store import HelixBackedRagStore
 from state_aware_rag.llm import JsonLlamaPlannerAndWriter, LocalHeuristicLLM
 from state_aware_rag.orchestrator import StateAwareRag
@@ -14,7 +16,7 @@ from state_aware_rag.store import SQLiteRagStore
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="state-aware-rag")
     parser.add_argument("--db", default="rag.sqlite3", help="SQLite database path")
-    parser.add_argument("--backend", choices=["sqlite", "helix"], default="sqlite")
+    parser.add_argument("--backend", choices=["sqlite", "helix"], default="helix")
     sub = parser.add_subparsers(dest="command", required=True)
 
     ingest = sub.add_parser("ingest", help="Ingest a text or markdown file")
@@ -40,7 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config = RagConfig(max_rounds=getattr(args, "max_rounds", 3))
-    store = _build_store(args, config)
+    try:
+        store = _build_store(args, config)
+    except RuntimeError as exc:
+        if getattr(args, "backend", "helix") == "helix":
+            print(f"HelixDB backend is not available: {exc}", file=sys.stderr)
+            print(helix_startup_hint(), file=sys.stderr)
+            return 2
+        raise
     bosun = _build_bosun(args)
     llm = _build_llm(args)
     rag = StateAwareRag(store=store, config=config, bosun=bosun, llm=llm)
@@ -88,7 +97,7 @@ def _build_bosun(args: argparse.Namespace) -> RuleBosunScorer:
 
 
 def _build_store(args: argparse.Namespace, config: RagConfig):
-    if getattr(args, "backend", "sqlite") == "helix":
+    if getattr(args, "backend", "helix") == "helix":
         return HelixBackedRagStore(args.db, config)
     return SQLiteRagStore(args.db, config)
 

@@ -132,6 +132,10 @@ class HelixBackedRagStore(SQLiteRagStore):
         for evidence_id in evidence_ids:
             self._link_nodes("MemoryNote", canonical_note_id, "SUPPORTED_BY", "Evidence", evidence_id)
 
+    def add_duplicate_edge(self, duplicate_note_id: str, canonical_note_id: str, score: float) -> None:
+        super().add_duplicate_edge(duplicate_note_id, canonical_note_id, score)
+        self._link_nodes("MemoryNote", duplicate_note_id, "DUPLICATE_OF", "MemoryNote", canonical_note_id, {"score": score})
+
     def record_round_log(self, log: RoundLog) -> None:
         super().record_round_log(log)
         self._add_search_round_node(log)
@@ -220,7 +224,28 @@ class HelixBackedRagStore(SQLiteRagStore):
         for candidate in self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.GRAPH):
             if candidate.chunk_id in seen:
                 continue
+            seen.add(candidate.chunk_id)
             candidates.append(candidate)
+            if len(candidates) >= top_k:
+                break
+        # HelixBackedRagStore は Python の型復元用に SQLite mirror を保持する。
+        # Helix native traversal へ移すまでは、採用済み Evidence と同じ Document の近傍 Chunk を mirror から補完する。
+        for chunk in self.neighbor_chunks_for_evidence(working_memory_id):
+            if chunk.id in seen:
+                continue
+            seen.add(chunk.id)
+            candidates.append(
+                RetrievalCandidate(
+                    chunk_id=chunk.id,
+                    body=chunk.body,
+                    method=RetrievalMethod.GRAPH,
+                    raw_score=1.0,
+                    raw_rank=len(candidates) + 1,
+                    source_uri=chunk.source_uri,
+                    graph_reason="採用済み Evidence と同じ Document の前後 Chunk",
+                    retrieval_methods=(RetrievalMethod.GRAPH,),
+                )
+            )
             if len(candidates) >= top_k:
                 break
         return candidates
@@ -473,6 +498,8 @@ class HelixBackedRagStore(SQLiteRagStore):
                     raw_rank=rank,
                     source_uri=source_uri,
                     retrieval_methods=(method,),
+                    vector_rank=rank if method == RetrievalMethod.VECTOR else None,
+                    text_rank=rank if method == RetrievalMethod.TEXT else None,
                 )
             )
         return candidates

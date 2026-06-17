@@ -150,6 +150,8 @@ class RetrievalCandidate:
     source_uri: str
     graph_reason: str | None = None
     retrieval_methods: tuple[RetrievalMethod, ...] = field(default_factory=tuple)
+    vector_rank: int | None = None
+    text_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -236,4 +238,3 @@ class ExtractionResult:
     chunk_id: str
     entities: tuple[Entity, ...]
     relations: tuple[Relation, ...]
-

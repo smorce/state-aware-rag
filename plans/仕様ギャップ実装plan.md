@@ -4,27 +4,75 @@ overview: 前回監査で特定した仕様との差分を、HelixDB を CLI 既
 todos:
   - id: phase1-strategy-stop
     content: "Phase 1-1/1-2: select_actions に state を渡し score_action でソート、停止条件に open_questions 空 COMPLETED を追加"
-    status: pending
+    status: completed
   - id: phase1-openq-duplicate
     content: "Phase 1-3/1-4: open_questions 個別解決、DUPLICATE shadow note + DUPLICATE_OF エッジ（SQLite + Helix）"
-    status: pending
+    status: completed
   - id: phase2-helix-default
     content: "Phase 2: CLI 既定 helix、helix_graph_search に neighbor_chunks 補完、Helix 未起動時 UX"
-    status: pending
+    status: completed
   - id: phase3-scores-ranks
     content: "Phase 3: MemoryNote スコアの Evidence 反映、merge_candidates の vector_rank/text_rank"
-    status: pending
+    status: completed
   - id: tests-docs
     content: 上記に対応する pytest 追加と README / verification.md 更新
-    status: pending
+    status: completed
 isProject: false
 ---
 
 # 仕様ギャップ埋め込み実装計画
 
+本計画は `.agent/PLANS.md` に従って維持する生きた ExecPlan である。実装者は、進捗、発見、判断、結果をこのファイルへ追記し、現在の作業ツリーだけから再開できる状態を保つ。
+
+## Purpose / Big Picture
+
+この変更により、CLI は HelixDB を既定の検索 backend として使い、検索ループは仕様書の停止条件、重複メモ処理、open questions 管理により近い挙動になる。利用者は HelixDB を起動して通常の `state-aware-rag ingest` / `state-aware-rag ask` を実行するだけで Helix 経路を使え、未起動の場合は英語の明確なエラーと起動手順を受け取る。開発者は `uv run pytest` で、SQLite mirror と Helix fake の両方に期待するエッジや検索候補が作られることを確認できる。
+
+## Progress
+
+- [x] (2026-06-17 00:00Z) `.agent/PLANS.md` と既存計画、対象コード、既存テストを読んだ。
+- [x] (2026-06-17 02:30Z) Phase 1-1/1-2: `select_actions` に `SearchState` を渡し、`score_action()` 降順選定と open questions 空の `COMPLETED` 停止条件を実装した。
+- [x] (2026-06-17 02:30Z) Phase 1-3/1-4: open questions の個別解決、duplicate shadow note、SQLite / Helix の `DUPLICATE_OF` エッジを実装した。
+- [x] (2026-06-17 02:30Z) Phase 2: CLI 既定を Helix に変更し、Helix graph search に SQLite mirror 経由の前後 Chunk 補完と未起動時 UX を追加した。
+- [x] (2026-06-17 02:30Z) Phase 3: MemoryNote に Evidence 由来スコアを反映し、`RetrievalCandidate` に `vector_rank` / `text_rank` を保持した。
+- [x] (2026-06-17 02:30Z) テストとドキュメントを更新し、`uv run pytest` で 43 passed を確認した。
+
+## Surprises & Discoveries
+
+- Observation: `duplicate_edges` テーブルと `add_duplicate_edge()` は既に SQLite 側に存在するが、重複検出時に呼び出されていなかった。
+  Evidence: `src/state_aware_rag/store.py` にテーブル定義とメソッドがあり、`src/state_aware_rag/orchestrator.py` の duplicate 分岐は `merge_duplicate_note()` のみを呼んでいた。
+
+- Observation: 既存の `HelixBackedRagStore` は初期化時に `ensure_indexes()` で Helix query を発行するため、CLI の store 構築時点で未起動を検出できる。
+  Evidence: `src/state_aware_rag/helix_store.py` の `__init__()` は `self.ensure_indexes()` を呼び、`HelixHttpClient.query()` が `RuntimeError("HelixDB query failed: ...")` を送出する。
+
+- Observation: 追加テストを含む全テストは通過したが、CUDA driver が古い環境警告は既存の Ruri embedder テストで継続して出る。
+  Evidence: `uv run pytest` は `43 passed, 1 warning in 10.03s`。
+
+## Decision Log
+
+- Decision: 既存の `duplicate_edges` テーブルをそのまま使い、重複時は duplicate status の shadow note を作ってから `DUPLICATE_OF` を張る。
+  Rationale: 既存 active-only フィルタで最終回答への混入を防げるため、新しいデータモデルを増やさず仕様ギャップを埋められる。
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: Helix graph search の前後 Chunk 補完は Phase 2 の最小実装として SQLite mirror の `neighbor_chunks_for_evidence()` を使う。
+  Rationale: `HelixBackedRagStore` は型復元用 mirror を常に持つため、Helix traversal を大きく変えずに SQLite 経路と同等の探索面を足せる。
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: CLI の Helix 未起動 UX は専用 health endpoint ではなく、store 構築時の既存 `ensure_indexes()` query を捕捉して英語メッセージに変換する。
+  Rationale: 実際に必要な TypeScript query build と HTTP query の両方を検証でき、追加の Helix API 仮定を増やさない。
+  Date/Author: 2026-06-17 / Codex
+
+- Decision: open questions の個別解決は normalized 文字列の包含または token overlap 0.20 以上で判定する。
+  Rationale: 英語の `store` / `stores` のような軽い語形差でも、主要語が重なれば解決できる一方、無関係な質問は残る。既存の軽量 tokenizer と `overlap_score()` を再利用できる。
+  Date/Author: 2026-06-17 / Codex
+
+## Outcomes & Retrospective
+
+2026-06-17 / Codex: 計画内の Phase 1 から Phase 3 までを実装した。`SocraticSearchStrategy.select_actions()` は `score_action()` を使い、検索ループは active メモありかつ未解決 open questions なしで `COMPLETED` を返せるようになった。重複 claim は active note を増やさず duplicate status の shadow note と `DUPLICATE_OF` エッジを残し、canonical note には evidence を merge する。CLI 既定は Helix になり、Helix graph search は mirror から Evidence 近傍 Chunk を補完する。`uv run pytest` は 43 passed。MCTS 本格実装は計画どおり見送り、仕様書にスタブ扱いを追記した。
+
 ## 現状と目標
 
-前回監査で未達だった主要項目:
+前回監査で未達だった主要項目。2026-06-17 の実装後は Progress と Outcomes の通り、MCTS 本格実装以外は完了済み:
 
 | ギャップ | 優先度 |
 |---------|--------|
@@ -69,8 +117,8 @@ flowchart TD
 現状 `select_actions` は `expected_gain`（常に 1.0）だけでソートしている:
 
 ```56:57:src/state_aware_rag/strategy.py
-    def select_actions(self, actions: list[SearchAction], budget: SearchBudget) -> list[SearchAction]:
-        return sorted(actions, key=lambda action: action.expected_gain, reverse=True)[: budget.max_actions]
+    def select_actions(self, actions: list[SearchAction], budget: SearchBudget, state: SearchState) -> list[SearchAction]:
+        return sorted(actions, key=lambda action: self.score_action(action, state), reverse=True)[: budget.max_actions]
 ```
 
 **変更内容:**
@@ -260,3 +308,9 @@ Phase 3-1, 3-2           ─> 任意・最後
 - [`README.md`](README.md): 既定 `helix`、SQLite フォールバック、起動前提
 - [`docs/verification.md`](docs/verification.md): 検証手順を Helix 既定に合わせて更新
 - 仕様書 §16 の MCTS 行に「スタブのみ・本格実装は将来」と注記（任意・1 行）
+
+---
+
+## Plan Revision Note
+
+2026-06-17 / Codex: `.agent/PLANS.md` に従い、計画ファイルへ Purpose / Progress / Surprises & Discoveries / Decision Log / Outcomes & Retrospective を追加し、実装完了後に進捗と検証結果を更新した。理由は、仕様ギャップ修正の実装内容、採用した設計判断、`uv run pytest` の結果をこのファイルだけで追跡できるようにするためである。

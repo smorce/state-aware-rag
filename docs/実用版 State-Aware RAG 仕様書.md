@@ -675,7 +675,7 @@ class SocraticSearchStrategy implements SearchStrategy {
     // priority, 未探索性, open_question との対応で機械的に点数化する
   }
 
-  selectActions(actions: SearchAction[], budget: SearchBudget): SearchAction[] {
+  selectActions(actions: SearchAction[], budget: SearchBudget, state: SearchState): SearchAction[] {
     // 点数が高い順に最大3件選ぶ
   }
 }
@@ -683,7 +683,7 @@ class SocraticSearchStrategy implements SearchStrategy {
 
 ### 9.6 将来実装
 
-将来、`MctsSearchStrategy` を追加する。
+将来、`MctsSearchStrategy` を追加する。現行 Python 実装では差し替え口と軽いスタブだけを置き、本格的な木探索は今回の実装範囲に含めない。
 
 ```typescript
 class MctsSearchStrategy implements SearchStrategy {
@@ -695,7 +695,7 @@ class MctsSearchStrategy implements SearchStrategy {
     // 期待情報利得、根拠数、重複率、矛盾率、コストを使って評価する
   }
 
-  selectActions(actions: SearchAction[], budget: SearchBudget): SearchAction[] {
+  selectActions(actions: SearchAction[], budget: SearchBudget, state: SearchState): SearchAction[] {
     // 探索と活用のバランスで選ぶ
   }
 }

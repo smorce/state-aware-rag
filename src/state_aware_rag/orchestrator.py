@@ -14,10 +14,12 @@ from state_aware_rag.models import (
     SearchState,
     WorkingMemory,
     WorkingMemoryStatus,
+    NoteStatus,
 )
 from state_aware_rag.retrieval import Retriever
 from state_aware_rag.store import SQLiteRagStore
 from state_aware_rag.strategy import SearchStrategy, SocraticSearchStrategy
+from state_aware_rag.text import normalize_claim, overlap_score
 
 
 class StateAwareRag:
@@ -81,6 +83,7 @@ class StateAwareRag:
             selected = self.search_strategy.select_actions(
                 actions,
                 SearchBudget(max_actions=self.config.max_sub_questions_per_round),
+                state,
             )
             if not selected:
                 stop_status = WorkingMemoryStatus.COMPLETED
@@ -100,7 +103,13 @@ class StateAwareRag:
                 no_new_note_rounds += 1
                 low_gain_rounds += 1
                 gain = 0.0
-                stop_status = self._stop_status(round_number, no_new_note_rounds, low_gain_rounds)
+                stop_status = self._stop_status(
+                    round_number,
+                    no_new_note_rounds,
+                    low_gain_rounds,
+                    open_question_count=len(open_questions),
+                    active_note_count=len(notes),
+                )
                 self._record_log(wm.id, round_number, [a.action_id for a in selected], len(merged), [], 0, 0, 0, 0, gain, stop_status.value if stop_status else None)
                 self.store.update_working_memory(wm.id, round_count=round_number)
                 if stop_status:
@@ -114,14 +123,22 @@ class StateAwareRag:
                     self.store.add_open_question(wm.id, str(item["question"]), str(item.get("reason", "")))
 
             if accepted_count > 0:
-                self.store.resolve_open_questions(wm.id)
                 no_new_note_rounds = 0
             else:
                 no_new_note_rounds += 1
 
             gain = accepted_count + 0.5 * len(accepted_evidence) - 0.5 * duplicate_count - 0.5 * conflict_count
+            current_open_questions = self._open_questions(wm.id)
+            current_active_note_count = len(self.store.list_memory_notes(wm.id))
+            # 全候補低スコアが続く場合は accepted evidence が空のラウンドと同じ低 gain 停止へ集約する。
             low_gain_rounds = low_gain_rounds + 1 if gain <= 0 else 0
-            stop_status = self._stop_status(round_number, no_new_note_rounds, low_gain_rounds)
+            stop_status = self._stop_status(
+                round_number,
+                no_new_note_rounds,
+                low_gain_rounds,
+                open_question_count=len(current_open_questions),
+                active_note_count=current_active_note_count,
+            )
             self._record_log(
                 wm.id,
                 round_number,
@@ -208,10 +225,26 @@ class StateAwareRag:
                     duplicate_score = score
                     break
             if duplicate_note is not None:
+                support_score, relevance_score = self._scores_for_evidence(evidence_ids, fallback=float(note_item.get("confidence", 0.75)))
+                shadow = self.store.create_memory_note(
+                    working_memory_id,
+                    claim,
+                    str(note_item.get("note_type", "fact")),
+                    float(note_item.get("confidence", 0.75)),
+                    evidence_ids,
+                    round_number,
+                    support_score=support_score,
+                    relevance_score=relevance_score,
+                    novelty_score=max(0.0, 1.0 - duplicate_score),
+                    status=NoteStatus.DUPLICATE,
+                )
                 self.store.merge_duplicate_note(duplicate_note.id, evidence_ids, duplicate_score)
+                self.store.add_duplicate_edge(shadow.id, duplicate_note.id, duplicate_score)
+                self._resolve_open_questions_for_claim(working_memory_id, claim)
                 duplicate_count += 1
                 continue
 
+            support_score, relevance_score = self._scores_for_evidence(evidence_ids, fallback=float(note_item.get("confidence", 0.75)))
             new_conflict_score = 0.0
             conflicts: list[tuple[str, float]] = []
             for existing in existing_notes:
@@ -226,21 +259,56 @@ class StateAwareRag:
                 float(note_item.get("confidence", 0.75)),
                 evidence_ids,
                 round_number,
+                support_score=support_score,
+                relevance_score=relevance_score,
                 conflict_score=new_conflict_score,
             )
+            self._resolve_open_questions_for_claim(working_memory_id, claim)
             for existing_id, score in conflicts:
                 self.store.add_conflict(existing_id, note.id, score)
                 conflict_count += 1
             accepted_count += 1
         return accepted_count, duplicate_count, conflict_count
 
-    def _stop_status(self, round_number: int, no_new_note_rounds: int, low_gain_rounds: int) -> WorkingMemoryStatus | None:
+    def _scores_for_evidence(self, evidence_ids: list[str], *, fallback: float) -> tuple[float, float]:
+        evidence: list[Evidence] = []
+        for evidence_id in evidence_ids:
+            try:
+                evidence.append(self.store.get_evidence(evidence_id))
+            except KeyError:
+                continue
+        if not evidence:
+            return fallback, fallback
+        support_score = sum(item.memory_value_score for item in evidence) / len(evidence)
+        relevance_score = sum(item.relevance_score for item in evidence) / len(evidence)
+        return support_score, relevance_score
+
+    def _resolve_open_questions_for_claim(self, working_memory_id: str, claim: str) -> None:
+        normalized_claim = normalize_claim(claim)
+        for item in self._open_questions(working_memory_id):
+            normalized_question = normalize_claim(item.question)
+            if not normalized_question:
+                continue
+            if normalized_question in normalized_claim or overlap_score(normalized_claim, normalized_question) >= 0.20:
+                self.store.resolve_open_question(working_memory_id, item.question)
+
+    def _stop_status(
+        self,
+        round_number: int,
+        no_new_note_rounds: int,
+        low_gain_rounds: int,
+        *,
+        open_question_count: int,
+        active_note_count: int,
+    ) -> WorkingMemoryStatus | None:
         if no_new_note_rounds >= self.config.no_new_note_limit:
             return WorkingMemoryStatus.STOPPED_BY_NO_NEW_NOTES
         if low_gain_rounds >= self.config.low_gain_limit:
             return WorkingMemoryStatus.STOPPED_BY_LOW_GAIN
         if round_number >= self.config.max_rounds:
             return WorkingMemoryStatus.STOPPED_BY_MAX_ROUNDS
+        if active_note_count > 0 and open_question_count == 0:
+            return WorkingMemoryStatus.COMPLETED
         return None
 
     def _memory_summary(self, working_memory_id: str) -> str:

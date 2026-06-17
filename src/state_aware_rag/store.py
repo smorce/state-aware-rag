@@ -461,6 +461,12 @@ class SQLiteRagStore:
         rows = self.conn.execute("SELECT * FROM evidence WHERE working_memory_id = ? ORDER BY rowid", (working_memory_id,))
         return [self._row_to_evidence(row) for row in rows]
 
+    def get_evidence(self, evidence_id: str) -> Evidence:
+        row = self.conn.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Evidence not found: {evidence_id}")
+        return self._row_to_evidence(row)
+
     def create_memory_note(
         self,
         working_memory_id: str,
@@ -474,6 +480,7 @@ class SQLiteRagStore:
         relevance_score: float | None = None,
         novelty_score: float = 1.0,
         conflict_score: float = 0.0,
+        status: NoteStatus = NoteStatus.ACTIVE,
     ) -> MemoryNote:
         normalized = normalize_claim(claim)
         note = MemoryNote(
@@ -491,7 +498,7 @@ class SQLiteRagStore:
             embedding=self.embedder.embed_claim(claim),
             created_round=created_round,
             last_updated_round=created_round,
-            status=NoteStatus.ACTIVE,
+            status=status,
         )
         self.conn.execute(
             "INSERT INTO memory_notes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -853,6 +860,13 @@ class SQLiteRagStore:
 
     def resolve_open_questions(self, working_memory_id: str) -> None:
         self.conn.execute("UPDATE open_questions SET resolved = 1 WHERE working_memory_id = ?", (working_memory_id,))
+        self.conn.commit()
+
+    def resolve_open_question(self, working_memory_id: str, question: str) -> None:
+        self.conn.execute(
+            "UPDATE open_questions SET resolved = 1 WHERE working_memory_id = ? AND question = ?",
+            (working_memory_id, question),
+        )
         self.conn.commit()
 
     def record_round_log(self, log: RoundLog) -> None:

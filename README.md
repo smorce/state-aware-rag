@@ -16,11 +16,14 @@
 
 ## 使い方
 
+CLI の既定 backend は `helix` です。先に HelixDB を起動してから ingest / ask を実行してください。HelixDB が未起動の場合、CLI は英語のエラーメッセージと起動手順を表示して終了します。
+
 ```powershell
 $env:PYTHONUTF8='1'
 $env:UV_LINK_MODE='copy'
-uv run state-aware-rag --db .\rag.sqlite3 ingest .\docs\sample.md
-uv run state-aware-rag --db .\rag.sqlite3 ask "この文書の要点は？" --llm server
+.\.tools\helix.exe start dev --port 6969 --persist
+uv run state-aware-rag --db .\helix_mirror.sqlite3 ingest .\docs\sample.md
+uv run state-aware-rag --db .\helix_mirror.sqlite3 ask "この文書の要点は？" --llm server
 ```
 
 埋め込みは既定で `cl-nagoya/ruri-v3-310m` (`RuriEmbedder`) を使います。文書には `検索文書: `、クエリには `検索クエリ: ` のプレフィックスを付けてベクトル化します。GPU があれば `cuda`、なければ `cpu` に自動切替します。軽量な開発用フォールバックが必要な場合は `EMBEDDING_BACKEND=hashed` または `RagConfig(embedding_backend="hashed")` を指定してください。
@@ -73,20 +76,20 @@ Python 側では `HelixHttpClient` が `http://localhost:6969/v1/query` に dyna
 HelixDB backend で実行する場合:
 
 ```powershell
-uv run state-aware-rag --backend helix --db .\helix_mirror.sqlite3 ingest .\docs\sample.md
-uv run state-aware-rag --backend helix --db .\helix_mirror.sqlite3 ask "この文書の要点は？" --llm server --bosun xs
+uv run state-aware-rag --db .\helix_mirror.sqlite3 ingest .\docs\sample.md
+uv run state-aware-rag --db .\helix_mirror.sqlite3 ask "この文書の要点は？" --llm server --bosun xs
 ```
 
 Linux:
 
 ```bash
-PYTHONUTF8=1 UV_LINK_MODE=copy uv run state-aware-rag --backend helix \
+PYTHONUTF8=1 UV_LINK_MODE=copy uv run state-aware-rag \
   --db helix_mirror.sqlite3 ingest docs/sample.md
-PYTHONUTF8=1 UV_LINK_MODE=copy uv run state-aware-rag --backend helix \
+PYTHONUTF8=1 UV_LINK_MODE=copy uv run state-aware-rag \
   --db helix_mirror.sqlite3 ask "この文書の要点は？" --llm server --bosun xs
 ```
 
-`--backend helix` は HelixDB に `Document` / `Chunk` / `Entity` / `Question` / `WorkingMemory` / `Evidence` / `MemoryNote` / `SearchRound` ノードを書き込み、`HAS_CHUNK` / `MENTIONS` / `HAS_MEMORY` / `FROM_CHUNK` / `HAS_NOTE` / `SUPPORTED_BY` / `RELATED_TO` / `RETURNED` / `UPDATED` などの主要エッジを張ります。検索時は HelixDB の `vectorSearchNodesWith`、`textSearchNodesWith`、`Entity <- MENTIONS - Chunk` と `WorkingMemory -> HAS_NOTE -> SUPPORTED_BY -> FROM_CHUNK` の graph traversal を使います。Python 側の SQLite は ID と型復元の mirror として残します。
+`--backend helix` は HelixDB に `Document` / `Chunk` / `Entity` / `Question` / `WorkingMemory` / `Evidence` / `MemoryNote` / `SearchRound` ノードを書き込み、`HAS_CHUNK` / `MENTIONS` / `HAS_MEMORY` / `FROM_CHUNK` / `HAS_NOTE` / `SUPPORTED_BY` / `RELATED_TO` / `DUPLICATE_OF` / `RETURNED` / `UPDATED` などの主要エッジを張ります。検索時は HelixDB の `vectorSearchNodesWith`、`textSearchNodesWith`、`Entity <- MENTIONS - Chunk` と `WorkingMemory -> HAS_NOTE -> SUPPORTED_BY -> FROM_CHUNK` の graph traversal を使います。さらに採用済み Evidence と同じ Document の前後 Chunk を SQLite mirror から補完します。Python 側の SQLite は ID と型復元の mirror として残します。
 
 ## テスト
 
@@ -107,7 +110,12 @@ Pop-Location
 
 ## 設計メモ
 
-外部 HelixDB が無い環境でも core flow を検証できるよう、SQLite backend も残しています。CLI の既定では、検索計画、Atomic Note 作成、最終回答生成に `LlamaServerEnvConfig` と `call_llama_server` を使い、Bosun 採点は `--bosun xs` が既定です。サーバーを使わない開発検証だけ `--llm local --bosun rule` を指定できます。
+外部 HelixDB が無い環境でも core flow を検証できるよう、SQLite backend も残しています。SQLite で開発検証する場合は `--backend sqlite` を明示してください。CLI の既定では、検索計画、Atomic Note 作成、最終回答生成に `LlamaServerEnvConfig` と `call_llama_server` を使い、Bosun 採点は `--bosun xs` が既定です。サーバーを使わない開発検証だけ `--llm local --bosun rule` を指定できます。
+
+```powershell
+uv run state-aware-rag --backend sqlite --db .\rag.sqlite3 ingest .\docs\sample.md
+uv run state-aware-rag --backend sqlite --db .\rag.sqlite3 ask "この文書の要点は？" --llm local --bosun rule
+```
 
 最終回答は `MemoryNote` と、それに紐づく `Evidence` の出典だけから生成します。検索候補本文を直接回答生成へ渡さないため、仕様の「作業用メモだけを使って回答する」制約を守ります。
 
