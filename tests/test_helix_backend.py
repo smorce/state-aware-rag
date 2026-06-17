@@ -12,19 +12,151 @@ from state_aware_rag.models import NoteStatus, RetrievalMethod, RoundLog, Workin
 class FakeHelixClient:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
+        self.nodes: dict[str, dict[str, dict[str, Any]]] = {}
+        self.edges: list[tuple[str, str, str]] = []
 
     def query(self, request_body: dict[str, Any]) -> dict[str, Any]:
         self.requests.append(request_body)
+        self._capture_write(request_body)
         encoded = str(request_body)
+        if request_body.get("request_type") != "read":
+            return {}
         if "VectorSearchNodes" in encoded:
             return {"chunks": [{"id": "chunk_1", "body": "vector body", "source_uri": "src", "distance": 0.25}]}
         if "Search" in encoded:
             return {"chunks": [{"id": "chunk_2", "body": "text body", "source_uri": "src", "distance": 0.5}]}
-        if "MENTIONS" in encoded:
-            return {"chunks": [{"id": "chunk_3", "body": "graph body", "source_uri": "src"}]}
-        if "HAS_NOTE" in encoded:
-            return {"chunks": [{"id": "chunk_4", "body": "memory graph body", "source_uri": "src"}]}
+        if "Evidence" in encoded and "working_memory_id" in encoded and "FROM_CHUNK" in encoded:
+            return {"anchors": self._anchor_rows(str(request_body.get("parameters", {}).get("working_memory_id", "")))}
+        if "anchor_id" in encoded and "HAS_CHUNK" in encoded:
+            return {"chunks": self._neighbor_rows(str(request_body.get("parameters", {}).get("anchor_id", "")))}
+        if "CONFLICTS_WITH" in encoded and "RELATED_TO" in encoded and "MENTIONS" in encoded:
+            direction = "in" if "'In': 'CONFLICTS_WITH'" in encoded else "out"
+            return {"chunks": self._conflict_entity_rows(str(request_body.get("parameters", {}).get("working_memory_id", "")), direction)}
+        if "CONFLICTS_WITH" in encoded and "SUPPORTED_BY" in encoded:
+            direction = "in" if "'In': 'CONFLICTS_WITH'" in encoded else "out"
+            return {"chunks": self._conflict_direct_rows(str(request_body.get("parameters", {}).get("working_memory_id", "")), direction)}
+        if "MENTIONS" in encoded and "entity" in request_body.get("parameters", {}):
+            rows = self._entity_rows(str(request_body["parameters"]["entity"]))
+            return {"chunks": rows or [{"id": "chunk_3", "body": "graph body", "source_uri": "src"}]}
+        if "HAS_NOTE" in encoded and "SUPPORTED_BY" in encoded:
+            rows = self._working_memory_note_rows(str(request_body.get("parameters", {}).get("working_memory_id", "")))
+            return {"chunks": rows or [{"id": "chunk_4", "body": "memory graph body", "source_uri": "src"}]}
         return {}
+
+    def _capture_write(self, request_body: dict[str, Any]) -> None:
+        if request_body.get("request_type") != "write":
+            return
+        params = request_body.get("parameters", {})
+        for query in request_body.get("query", {}).get("queries", []):
+            steps = query.get("Query", {}).get("steps", [])
+            for step in steps:
+                if "AddN" in step and params.get("id"):
+                    label = str(step["AddN"]["label"])
+                    self.nodes.setdefault(label, {})[str(params["id"])] = dict(params)
+                if "AddE" in step and params.get("from_id") and params.get("to_id"):
+                    label = str(step["AddE"]["label"])
+                    edge = (str(params["from_id"]), label, str(params["to_id"]))
+                    if edge not in self.edges:
+                        self.edges.append(edge)
+
+    def _node(self, node_id: str) -> dict[str, Any] | None:
+        for nodes in self.nodes.values():
+            if node_id in nodes:
+                return nodes[node_id]
+        return None
+
+    def _chunk_rows(self, chunk_ids: list[str]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for chunk_id in dict.fromkeys(chunk_ids):
+            chunk = self.nodes.get("Chunk", {}).get(chunk_id)
+            if chunk is not None:
+                rows.append(
+                    {
+                        "id": chunk_id,
+                        "body": chunk.get("body", ""),
+                        "source_uri": chunk.get("source_uri", ""),
+                        "position": chunk.get("position", 0),
+                        "document_id": chunk.get("document_id", ""),
+                    }
+                )
+        return rows
+
+    def _anchor_rows(self, working_memory_id: str) -> list[dict[str, Any]]:
+        chunk_ids: list[str] = []
+        for evidence_id, evidence in self.nodes.get("Evidence", {}).items():
+            if evidence.get("working_memory_id") != working_memory_id:
+                continue
+            chunk_ids.extend(to_id for from_id, label, to_id in self.edges if from_id == evidence_id and label == "FROM_CHUNK")
+        return self._chunk_rows(chunk_ids)
+
+    def _neighbor_rows(self, anchor_id: str) -> list[dict[str, Any]]:
+        doc_ids = [from_id for from_id, label, to_id in self.edges if label == "HAS_CHUNK" and to_id == anchor_id]
+        chunk_ids = [
+            to_id
+            for doc_id in doc_ids
+            for from_id, label, to_id in self.edges
+            if from_id == doc_id and label == "HAS_CHUNK"
+        ]
+        return self._chunk_rows(chunk_ids)
+
+    def _working_memory_note_ids(self, working_memory_id: str) -> list[str]:
+        return [to_id for from_id, label, to_id in self.edges if from_id == working_memory_id and label == "HAS_NOTE"]
+
+    def _conflicted_note_ids(self, working_memory_id: str, direction: str) -> list[str]:
+        note_ids = self._working_memory_note_ids(working_memory_id)
+        if direction == "in":
+            return [from_id for from_id, label, to_id in self.edges if label == "CONFLICTS_WITH" and to_id in note_ids]
+        return [to_id for from_id, label, to_id in self.edges if label == "CONFLICTS_WITH" and from_id in note_ids]
+
+    def _supported_chunk_ids(self, note_ids: list[str]) -> list[str]:
+        evidence_ids = [
+            to_id
+            for note_id in note_ids
+            for from_id, label, to_id in self.edges
+            if from_id == note_id and label == "SUPPORTED_BY"
+        ]
+        return [
+            to_id
+            for evidence_id in evidence_ids
+            for from_id, label, to_id in self.edges
+            if from_id == evidence_id and label == "FROM_CHUNK"
+        ]
+
+    def _working_memory_note_rows(self, working_memory_id: str) -> list[dict[str, Any]]:
+        return self._chunk_rows(self._supported_chunk_ids(self._working_memory_note_ids(working_memory_id)))
+
+    def _conflict_direct_rows(self, working_memory_id: str, direction: str) -> list[dict[str, Any]]:
+        return self._chunk_rows(self._supported_chunk_ids(self._conflicted_note_ids(working_memory_id, direction)))
+
+    def _conflict_entity_rows(self, working_memory_id: str, direction: str) -> list[dict[str, Any]]:
+        entity_ids = [
+            to_id
+            for note_id in self._conflicted_note_ids(working_memory_id, direction)
+            for from_id, label, to_id in self.edges
+            if from_id == note_id and label == "RELATED_TO"
+        ]
+        chunk_ids = [
+            from_id
+            for entity_id in entity_ids
+            for from_id, label, to_id in self.edges
+            if label == "MENTIONS" and to_id == entity_id
+        ]
+        return self._chunk_rows(chunk_ids)
+
+    def _entity_rows(self, canonical_name: str) -> list[dict[str, Any]]:
+        entity_ids = [
+            node_id
+            for nodes in self.nodes.values()
+            for node_id, node in nodes.items()
+            if node.get("canonical_name") == canonical_name
+        ]
+        chunk_ids = [
+            from_id
+            for entity_id in entity_ids
+            for from_id, label, to_id in self.edges
+            if label == "MENTIONS" and to_id == entity_id
+        ]
+        return self._chunk_rows(chunk_ids)
 
 
 def test_helix_query_builder_supports_parameterized_dynamic_json() -> None:
@@ -109,6 +241,14 @@ def test_helix_backed_store_writes_required_graph_edges(tmp_path: Path) -> None:
     assert "SearchRound" in sent
     assert "RETURNED" in sent
     assert "UPDATED" in sent
+    evidence_requests = [
+        request
+        for request in fake.requests
+        if request.get("request_type") == "write"
+        and request.get("parameters", {}).get("id") == evidence.id
+    ]
+    assert evidence_requests
+    assert evidence_requests[0]["parameters"]["working_memory_id"] == wm.id
 
 
 def test_helix_backed_store_writes_relation_edges_when_present(tmp_path: Path) -> None:
@@ -228,7 +368,7 @@ def test_helix_backed_store_writes_duplicate_of_edge(tmp_path: Path) -> None:
     assert "DUPLICATE_OF" in sent
 
 
-def test_helix_graph_search_includes_neighbor_chunks(tmp_path: Path) -> None:
+def test_helix_graph_search_includes_neighbor_chunks(tmp_path: Path, monkeypatch) -> None:
     fake = FakeHelixClient()
     store = HelixBackedRagStore(tmp_path / "mirror.sqlite3", http_client=fake, embedder=HashedEmbedder())
     doc = store.ingest_document(
@@ -258,6 +398,60 @@ def test_helix_graph_search_includes_neighbor_chunks(tmp_path: Path) -> None:
         source_uri="memory://neighbors",
     )
     store.create_memory_note(wm.id, "Evidence points to chunks.", "fact", 0.9, [evidence.id], 1)
+    monkeypatch.setattr(
+        store,
+        "neighbor_chunks_for_evidence",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SQLite mirror should not discover neighbor chunks")),
+    )
+
+    graph = store.helix_graph_search([], wm.id, 10)
+    neighbor_candidates = [
+        candidate
+        for candidate in graph
+        if candidate.graph_reason == "採用済み Evidence と同じ Document の前後 Chunk"
+    ]
+
+    assert neighbor_candidates
+    assert {candidate.chunk_id for candidate in neighbor_candidates} & {chunk.id for chunk in doc.chunks}
+    sent = "\n".join(str(request) for request in fake.requests)
+    assert "working_memory_id" in sent
+    assert "HAS_CHUNK" in sent
+
+
+def test_helix_graph_search_uses_unlinked_evidence_for_neighbor_chunks(tmp_path: Path, monkeypatch) -> None:
+    fake = FakeHelixClient()
+    store = HelixBackedRagStore(tmp_path / "mirror.sqlite3", http_client=fake, embedder=HashedEmbedder())
+    doc = store.ingest_document(
+        title="Doc",
+        body=(
+            "Alpha introduces working memory. "
+            "Beta explains that evidence points to chunks. "
+            "Gamma covers final answers."
+        ),
+        source_uri="memory://unlinked-neighbors",
+        chunk_size=35,
+        overlap=0,
+        extract_entities=False,
+    )
+    wm = store.create_working_memory("How does evidence connect?")
+    store.create_evidence(
+        wm.id,
+        doc.chunks[1].id,
+        round_number=1,
+        query="evidence chunks",
+        body_excerpt=doc.chunks[1].body,
+        retrieval_method=RetrievalMethod.TEXT,
+        raw_rank=1,
+        relevance_score=0.9,
+        memory_value_score=0.9,
+        accepted=True,
+        source_uri="memory://unlinked-neighbors",
+    )
+    monkeypatch.setattr(
+        store,
+        "neighbor_chunks_for_evidence",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SQLite mirror should not discover neighbor chunks")),
+    )
 
     graph = store.helix_graph_search([], wm.id, 10)
     neighbor_candidates = [
@@ -349,6 +543,50 @@ def test_helix_graph_search_queries_conflicts_with(tmp_path: Path) -> None:
 
     sent = "\n".join(str(request) for request in fake.requests)
     assert "CONFLICTS_WITH" in sent
+
+
+def test_helix_graph_search_uses_conflicted_note_entities(tmp_path: Path, monkeypatch) -> None:
+    fake = FakeHelixClient()
+    store = HelixBackedRagStore(tmp_path / "mirror.sqlite3", http_client=fake, embedder=HashedEmbedder())
+    doc = store.ingest_document(
+        title="Risk",
+        body="RiskSignal appears in the audit appendix.",
+        source_uri="memory://risk",
+        extract_entities=False,
+    )
+    store.add_entity("RiskSignal")
+    store.link_chunk_entity(doc.chunks[0].id, "RiskSignal")
+    store._sync_chunk_graph(doc.chunks[0].id)
+    wm = store.create_working_memory("What risk is unresolved?")
+    active = store.create_memory_note(wm.id, "plain claim one", "fact", 0.9, [], 1)
+    conflicted = store.create_memory_note(
+        wm.id,
+        "RiskSignal is unresolved.",
+        "fact",
+        0.8,
+        [],
+        1,
+        status=NoteStatus.DUPLICATE,
+    )
+    store.add_conflict(active.id, conflicted.id, 0.8)
+    monkeypatch.setattr(
+        store,
+        "chunks_for_conflicted_notes",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("SQLite mirror should not discover conflicted chunks")),
+    )
+
+    graph = store.helix_graph_search([], wm.id, 10)
+    conflicted_candidates = [
+        candidate
+        for candidate in graph
+        if candidate.graph_reason == "矛盾の可能性がある MemoryNote 経由で発見"
+    ]
+
+    assert conflicted_candidates
+    assert conflicted_candidates[0].chunk_id == doc.chunks[0].id
+    sent = "\n".join(str(request) for request in fake.requests)
+    assert "RELATED_TO" in sent
+    assert "MENTIONS" in sent
 
 
 def test_helix_ingest_normalizes_chunk_body_for_text_index(tmp_path: Path) -> None:

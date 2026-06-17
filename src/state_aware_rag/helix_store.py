@@ -134,8 +134,34 @@ class HelixBackedRagStore(SQLiteRagStore):
         )
         return wm
 
-    def create_evidence(self, *args, **kwargs) -> Evidence:
-        ev = super().create_evidence(*args, **kwargs)
+    def create_evidence(
+        self,
+        working_memory_id: str,
+        chunk_id: str,
+        *,
+        round_number: int,
+        query: str,
+        body_excerpt: str,
+        retrieval_method: RetrievalMethod,
+        raw_rank: int,
+        relevance_score: float,
+        memory_value_score: float,
+        accepted: bool,
+        source_uri: str,
+    ) -> Evidence:
+        ev = super().create_evidence(
+            working_memory_id,
+            chunk_id,
+            round_number=round_number,
+            query=query,
+            body_excerpt=body_excerpt,
+            retrieval_method=retrieval_method,
+            raw_rank=raw_rank,
+            relevance_score=relevance_score,
+            memory_value_score=memory_value_score,
+            accepted=accepted,
+            source_uri=source_uri,
+        )
         self._add_evidence_node(ev)
         self._link_nodes("Evidence", ev.id, "FROM_CHUNK", "Chunk", ev.chunk_id)
         return ev
@@ -259,57 +285,131 @@ class HelixBackedRagStore(SQLiteRagStore):
             if len(candidates) >= top_k:
                 break
 
-        response = self._query_with_values(
-            (
-                'readBatch().varAs("chunks", '
-                'g().nWithLabel("WorkingMemory").where(Predicate.eqParam("id", "working_memory_id"))'
-                '.out("HAS_NOTE").out("CONFLICTS_WITH").out("SUPPORTED_BY").out("FROM_CHUNK")'
-                '.project([PropertyProjection.new("id"), PropertyProjection.new("body"), '
-                'PropertyProjection.new("source_uri")]).limit(params.k))'
-                '.returning(["chunks"])'
-            ),
-            "defineParams({working_memory_id:param.string(), k:param.i64()})",
-            {"working_memory_id": working_memory_id, "k": top_k},
-        )
-        for candidate in self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.GRAPH):
+        for candidate in self.helix_neighbor_chunks_for_evidence(working_memory_id, top_k - len(candidates)):
             if candidate.chunk_id in seen:
                 continue
             seen.add(candidate.chunk_id)
-            candidates.append(
-                RetrievalCandidate(
-                    chunk_id=candidate.chunk_id,
-                    body=candidate.body,
-                    method=candidate.method,
-                    raw_score=candidate.raw_score,
-                    raw_rank=len(candidates) + 1,
-                    source_uri=candidate.source_uri,
-                    graph_reason="矛盾の可能性がある MemoryNote 経由で発見",
-                    retrieval_methods=candidate.retrieval_methods,
-                )
-            )
+            candidates.append(self._rerank_graph_candidate(candidate, len(candidates) + 1))
             if len(candidates) >= top_k:
-                break
-        # HelixBackedRagStore は Python の型復元用に SQLite mirror を保持する。
-        # Helix native traversal へ移すまでは、採用済み Evidence と同じ Document の近傍 Chunk を mirror から補完する。
-        mirror_sources = [
-            (self.neighbor_chunks_for_evidence(working_memory_id), "採用済み Evidence と同じ Document の前後 Chunk"),
-            (self.chunks_for_conflicted_notes(working_memory_id), "矛盾の可能性がある MemoryNote 経由で発見"),
-        ]
-        for chunks, reason in mirror_sources:
-            for chunk in chunks:
-                if chunk.id in seen:
+                return candidates
+
+        for candidate in self.helix_chunks_for_conflicted_notes(working_memory_id, top_k - len(candidates)):
+            if candidate.chunk_id in seen:
+                continue
+            seen.add(candidate.chunk_id)
+            candidates.append(self._rerank_graph_candidate(candidate, len(candidates) + 1))
+            if len(candidates) >= top_k:
+                return candidates
+        return candidates
+
+    def helix_neighbor_chunks_for_evidence(
+        self, working_memory_id: str, top_k: int
+    ) -> list[RetrievalCandidate]:
+        if top_k <= 0:
+            return []
+        anchor_response = self._query_with_values(
+            (
+                'readBatch().varAs("anchors", '
+                'g().nWithLabel("Evidence").where(Predicate.eqParam("working_memory_id", "working_memory_id"))'
+                '.out("FROM_CHUNK")'
+                '.project([PropertyProjection.new("id"), PropertyProjection.new("document_id"), '
+                'PropertyProjection.new("position")]))'
+                '.returning(["anchors"])'
+            ),
+            "defineParams({working_memory_id:param.string()})",
+            {"working_memory_id": working_memory_id},
+        )
+        anchors: list[dict[str, Any]] = []
+        for row in extract_returned_rows(anchor_response, "anchors"):
+            chunk_id = str(self._row_value(row, "id") or "")
+            position = self._row_int(row, "position")
+            if chunk_id and position is not None:
+                anchors.append({"id": chunk_id, "position": position})
+
+        candidates: list[RetrievalCandidate] = []
+        seen: set[str] = set()
+        for anchor in anchors:
+            response = self._query_with_values(
+                (
+                    'readBatch().varAs("chunks", '
+                    'g().nWithLabel("Chunk").where(Predicate.eqParam("id", "anchor_id"))'
+                    '.in("HAS_CHUNK").out("HAS_CHUNK")'
+                    '.project([PropertyProjection.new("id"), PropertyProjection.new("body"), '
+                    'PropertyProjection.new("source_uri"), PropertyProjection.new("position"), '
+                    'PropertyProjection.new("document_id")]).limit(params.k))'
+                    '.returning(["chunks"])'
+                ),
+                "defineParams({anchor_id:param.string(), k:param.i64()})",
+                {"anchor_id": anchor["id"], "k": top_k},
+            )
+            filtered_rows: list[dict[str, Any]] = []
+            for row in extract_returned_rows(response, "chunks"):
+                chunk_id = str(self._row_value(row, "id") or "")
+                position = self._row_int(row, "position")
+                if not chunk_id or chunk_id in seen or position is None:
                     continue
-                seen.add(chunk.id)
+                if abs(position - int(anchor["position"])) > 1:
+                    continue
+                seen.add(chunk_id)
+                filtered_rows.append(row)
+            for candidate in self._rows_to_candidates(filtered_rows, RetrievalMethod.GRAPH):
                 candidates.append(
                     RetrievalCandidate(
-                        chunk_id=chunk.id,
-                        body=chunk.body,
-                        method=RetrievalMethod.GRAPH,
-                        raw_score=1.0,
+                        chunk_id=candidate.chunk_id,
+                        body=candidate.body,
+                        method=candidate.method,
+                        raw_score=candidate.raw_score,
                         raw_rank=len(candidates) + 1,
-                        source_uri=chunk.source_uri,
-                        graph_reason=reason,
-                        retrieval_methods=(RetrievalMethod.GRAPH,),
+                        source_uri=candidate.source_uri,
+                        graph_reason="採用済み Evidence と同じ Document の前後 Chunk",
+                        retrieval_methods=candidate.retrieval_methods,
+                    )
+                )
+                if len(candidates) >= top_k:
+                    return candidates
+        return candidates
+
+    def helix_chunks_for_conflicted_notes(
+        self, working_memory_id: str, top_k: int
+    ) -> list[RetrievalCandidate]:
+        if top_k <= 0:
+            return []
+        path_templates = [
+            '.out("HAS_NOTE").out("CONFLICTS_WITH").out("SUPPORTED_BY").out("FROM_CHUNK")',
+            '.out("HAS_NOTE").in("CONFLICTS_WITH").out("SUPPORTED_BY").out("FROM_CHUNK")',
+            '.out("HAS_NOTE").out("CONFLICTS_WITH").out("RELATED_TO").in("MENTIONS")',
+            '.out("HAS_NOTE").in("CONFLICTS_WITH").out("RELATED_TO").in("MENTIONS")',
+        ]
+        candidates: list[RetrievalCandidate] = []
+        seen: set[str] = set()
+        for path in path_templates:
+            response = self._query_with_values(
+                (
+                    'readBatch().varAs("chunks", '
+                    'g().nWithLabel("WorkingMemory").where(Predicate.eqParam("id", "working_memory_id"))'
+                    f"{path}"
+                    '.project([PropertyProjection.new("id"), PropertyProjection.new("body"), '
+                    'PropertyProjection.new("source_uri"), PropertyProjection.new("position"), '
+                    'PropertyProjection.new("document_id")]).limit(params.k))'
+                    '.returning(["chunks"])'
+                ),
+                "defineParams({working_memory_id:param.string(), k:param.i64()})",
+                {"working_memory_id": working_memory_id, "k": top_k},
+            )
+            for candidate in self._rows_to_candidates(extract_returned_rows(response, "chunks"), RetrievalMethod.GRAPH):
+                if candidate.chunk_id in seen:
+                    continue
+                seen.add(candidate.chunk_id)
+                candidates.append(
+                    RetrievalCandidate(
+                        chunk_id=candidate.chunk_id,
+                        body=candidate.body,
+                        method=candidate.method,
+                        raw_score=candidate.raw_score,
+                        raw_rank=len(candidates) + 1,
+                        source_uri=candidate.source_uri,
+                        graph_reason="矛盾の可能性がある MemoryNote 経由で発見",
+                        retrieval_methods=candidate.retrieval_methods,
                     )
                 )
                 if len(candidates) >= top_k:
@@ -416,13 +516,15 @@ class HelixBackedRagStore(SQLiteRagStore):
 
     def _add_evidence_node(self, ev: Evidence) -> None:
         params = (
-            "defineParams({id:param.string(), chunk_id:param.string(), round:param.i64(), query:param.string(), "
+            "defineParams({id:param.string(), chunk_id:param.string(), working_memory_id:param.string(), "
+            "round:param.i64(), query:param.string(), "
             "body_excerpt:param.string(), retrieval_method:param.string(), raw_rank:param.i64(), "
             "relevance_score:param.f64(), memory_value_score:param.f64(), accepted:param.bool(), source_uri:param.string()})"
         )
         expression = (
             'writeBatch().varAs("evidence", g().addN("Evidence", {'
-            'id:PropertyInput.param("id"), chunk_id:PropertyInput.param("chunk_id"), round:PropertyInput.param("round"), '
+            'id:PropertyInput.param("id"), chunk_id:PropertyInput.param("chunk_id"), '
+            'working_memory_id:PropertyInput.param("working_memory_id"), round:PropertyInput.param("round"), '
             'query:PropertyInput.param("query"), body_excerpt:PropertyInput.param("body_excerpt"), '
             'retrieval_method:PropertyInput.param("retrieval_method"), raw_rank:PropertyInput.param("raw_rank"), '
             'relevance_score:PropertyInput.param("relevance_score"), memory_value_score:PropertyInput.param("memory_value_score"), '
@@ -435,6 +537,7 @@ class HelixBackedRagStore(SQLiteRagStore):
             {
                 "id": ev.id,
                 "chunk_id": ev.chunk_id,
+                "working_memory_id": self._working_memory_id_for_evidence(ev.id),
                 "round": ev.round,
                 "query": ev.query,
                 "body_excerpt": ev.body_excerpt,
@@ -545,16 +648,20 @@ class HelixBackedRagStore(SQLiteRagStore):
     def _rows_to_candidates(self, rows: list[dict[str, Any]], method: RetrievalMethod) -> list[RetrievalCandidate]:
         candidates: list[RetrievalCandidate] = []
         for rank, row in enumerate(rows, start=1):
-            chunk_id = str(row.get("id") or row.get("properties", {}).get("id") or "")
-            body = str(row.get("body") or row.get("properties", {}).get("body") or "")
-            source_uri = str(row.get("source_uri") or row.get("properties", {}).get("source_uri") or "")
+            chunk_id = str(self._row_value(row, "id") or "")
+            body = str(self._row_value(row, "body") or "")
+            source_uri = str(self._row_value(row, "source_uri") or "")
             try:
                 mirror_chunk = self.get_chunk(chunk_id)
                 body = mirror_chunk.body
                 source_uri = mirror_chunk.source_uri
             except KeyError:
                 pass
-            distance = row.get("distance", row.get("$distance", 0.0))
+            distance = self._row_value(row, "distance")
+            if distance is None:
+                distance = self._row_value(row, "$distance")
+            if distance is None:
+                distance = 0.0
             try:
                 raw_score = 1.0 / (1.0 + float(distance))
             except (TypeError, ValueError):
@@ -575,6 +682,46 @@ class HelixBackedRagStore(SQLiteRagStore):
                 )
             )
         return candidates
+
+    def _rerank_graph_candidate(self, candidate: RetrievalCandidate, rank: int) -> RetrievalCandidate:
+        return RetrievalCandidate(
+            chunk_id=candidate.chunk_id,
+            body=candidate.body,
+            method=candidate.method,
+            raw_score=candidate.raw_score,
+            raw_rank=rank,
+            source_uri=candidate.source_uri,
+            graph_reason=candidate.graph_reason,
+            retrieval_methods=candidate.retrieval_methods,
+        )
+
+    def _working_memory_id_for_evidence(self, evidence_id: str) -> str:
+        row = self.conn.execute(
+            "SELECT working_memory_id FROM evidence WHERE id = ?",
+            (evidence_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Evidence not found: {evidence_id}")
+        return str(row["working_memory_id"])
+
+    def _row_value(self, row: dict[str, Any], key: str) -> Any:
+        value = row.get(key)
+        if value is None:
+            properties = row.get("properties")
+            if isinstance(properties, dict):
+                value = properties.get(key)
+        if isinstance(value, dict):
+            for variant in ("String", "I64", "F64", "F32", "Bool"):
+                if variant in value:
+                    return value[variant]
+        return value
+
+    def _row_int(self, row: dict[str, Any], key: str) -> int | None:
+        value = self._row_value(row, key)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _query(self, expression: str) -> dict[str, Any]:
         return self.helix.query(self.query_builder.build(expression))

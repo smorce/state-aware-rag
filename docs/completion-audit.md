@@ -10,10 +10,12 @@
 - LLM で採用済み `Evidence` から短い `MemoryNote` を作る。
 - Bosun XS scorer で既存メモとの duplicate / conflict を判定する。
 - `WorkingMemory`、`MemoryNote`、`Evidence`、`SearchRound` と主要 graph edge を HelixDB に書く。
+- Helix `Evidence` に `working_memory_id` を同期し、note 未紐付けの採用済み Evidence も graph search の anchor にする。
 - HelixDB 上の `WorkingMemory` status / round_count / updated_at をループ中・終了時に同期する。
 - `SearchRound -RETURNED-> Evidence` を round log の accepted evidence ID で正確に紐付ける。
 - 日本語全文検索のため query と Helix `Chunk.body` を同じ正規化規則でスペース区切りにする。
-- `CONFLICTS_WITH` 起点の graph search で矛盾 note 関連 Chunk を候補へ含める。
+- 採用済み Evidence と同じ Document の前後 Chunk、`CONFLICTS_WITH` 起点の Evidence / Entity 関連 Chunk を Helix graph traversal で候補へ含める。
+- SQLite mirror は Helix backend の graph 候補発見には使わず、表示用原文と型復元に限定する。
 - Evidence はあるが active `MemoryNote` がない場合は §15.2 固定メッセージを返す。
 - オーケストレータ内部例外時は `WorkingMemoryStatus.FAILED` を保存して再送出する。
 - open question と gain に基づいて最大 3 ラウンドまで検索を繰り返す。

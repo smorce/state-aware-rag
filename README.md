@@ -91,7 +91,7 @@ PYTHONUTF8=1 UV_LINK_MODE=copy uv run state-aware-rag \
   --db helix_mirror.sqlite3 ask "この文書の要点は？" --llm server --bosun xs
 ```
 
-`--backend helix` は HelixDB に `Document` / `Chunk` / `Entity` / `Question` / `WorkingMemory` / `Evidence` / `MemoryNote` / `SearchRound` ノードを書き込み、`HAS_CHUNK` / `MENTIONS` / `HAS_MEMORY` / `FROM_CHUNK` / `HAS_NOTE` / `SUPPORTED_BY` / `RELATED_TO` / `DUPLICATE_OF` / `CONFLICTS_WITH` / `RETURNED` / `UPDATED` などの主要エッジを張ります。検索時は HelixDB の `vectorSearchNodesWith`、`textSearchNodesWith`、`Entity <- MENTIONS - Chunk`、`WorkingMemory -> HAS_NOTE -> SUPPORTED_BY -> FROM_CHUNK`、`WorkingMemory -> HAS_NOTE -> CONFLICTS_WITH -> SUPPORTED_BY -> FROM_CHUNK` の graph traversal を使います。さらに採用済み Evidence と同じ Document の前後 Chunk と conflict 関連 Chunk を SQLite mirror から補完します。Python 側の SQLite は ID と型復元の mirror として残します。
+`--backend helix` は HelixDB に `Document` / `Chunk` / `Entity` / `Question` / `WorkingMemory` / `Evidence` / `MemoryNote` / `SearchRound` ノードを書き込み、`HAS_CHUNK` / `MENTIONS` / `HAS_MEMORY` / `FROM_CHUNK` / `HAS_NOTE` / `SUPPORTED_BY` / `RELATED_TO` / `DUPLICATE_OF` / `CONFLICTS_WITH` / `RETURNED` / `UPDATED` などの主要エッジを張ります。検索時は HelixDB の `vectorSearchNodesWith`、`textSearchNodesWith`、`Entity <- MENTIONS - Chunk`、`WorkingMemory -> HAS_NOTE -> SUPPORTED_BY -> FROM_CHUNK`、`Evidence(working_memory_id) -> FROM_CHUNK -> Chunk -> in(HAS_CHUNK) -> Document -> out(HAS_CHUNK)`、`WorkingMemory -> HAS_NOTE -> CONFLICTS_WITH -> SUPPORTED_BY -> FROM_CHUNK`、`WorkingMemory -> HAS_NOTE -> CONFLICTS_WITH -> RELATED_TO -> Entity <- MENTIONS - Chunk` の graph traversal を使います。Python 側の SQLite mirror は ID、型復元、表示用原文 `body` の復元に残します。既存 Helix データで `Evidence.working_memory_id` が無い場合は、対象文書を再 ingest してください。
 
 ## テスト
 
