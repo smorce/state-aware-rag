@@ -9,7 +9,7 @@ dependencies = [
     "openai>=1.0",
     "openpyxl>=3.1",
     "sentence-transformers>=3.0",
-    "torch",
+    "torch==2.6.0",
 ]
 
 [project.optional-dependencies]
@@ -19,7 +19,7 @@ bosun-native = [
 ]
 ruri = [
     "sentence-transformers>=3.0",
-    "torch",
+    "torch==2.6.0",
 ]
 
 [build-system]
@@ -40,3 +40,22 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "gpu: requires CUDA-compatible PyTorch and NVIDIA driver",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]

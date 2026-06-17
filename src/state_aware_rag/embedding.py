@@ -59,7 +59,8 @@ class RuriEmbedder:
     """cl-nagoya/ruri-v3-310m を sentence-transformers でラップした実装。
 
     モデルカードに従い、document/query/topic/semantic で文頭プレフィックスを変える。
-    GPU があれば自動で cuda に乗る。
+    GPU は既定で `cuda`（`RURI_DEVICE=cuda`）。PyTorch は CUDA 12.4 ビルド（cu124）を使用し、
+    ドライバ CUDA 12.0 系と互換です。CPU のみの場合は `RURI_DEVICE=cpu`。
     """
 
     def __init__(

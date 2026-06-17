@@ -76,3 +76,33 @@ def test_ruri_embedder_loads_when_dependency_available(monkeypatch: pytest.Monke
     assert isinstance(vector, list)
     assert embedder.dimensions == len(vector)
     assert all(isinstance(value, float) for value in vector)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    importlib.util.find_spec("sentence_transformers") is None,
+    reason="sentence-transformers is an optional dependency; install with .[ruri] to run.",
+)
+def test_ruri_embedder_gpu_smoke() -> None:
+    import math
+
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip(
+            f"CUDA unavailable (torch {torch.__version__}, built_cuda={torch.version.cuda}). "
+            "GPU test requires a driver compatible with the installed PyTorch CUDA build."
+        )
+
+    embedder = RuriEmbedder(device="cuda")
+    model = embedder._ensure_model()
+    assert str(model.device).startswith("cuda")
+    assert embedder.dimensions == 768
+
+    query = embedder.embed_query("State-Aware RAG の要点は？")
+    doc = embedder.embed_documents(["作業用メモだけを根拠に回答する。"])[0]
+    assert len(query) == 768
+    cosine = sum(a * b for a, b in zip(query, doc))
+    norm = math.sqrt(sum(v * v for v in query))
+    assert math.isclose(norm, 1.0, abs_tol=1e-3)
+    assert cosine > 0.5
