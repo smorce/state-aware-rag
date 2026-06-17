@@ -11,6 +11,7 @@ from state_aware_rag.models import (
     OpenQuestion,
     RetrievalCandidate,
     RoundLog,
+    SearchAction,
     SearchBudget,
     SearchState,
     WorkingMemory,
@@ -27,12 +28,17 @@ from state_aware_rag.run_log import (
     ROUTE_ANSWER_UNHANDLED_EXCEPTION,
     ROUTE_ROUND_ATOMIC_NOTES_CREATED,
     ROUTE_ROUND_ATOMIC_NOTES_EMPTY,
+    ROUTE_ROUND_LOOP_CONTINUE,
+    ROUTE_ROUND_LOOP_STOPPED,
     ROUTE_ROUND_NO_ACCEPTED_EVIDENCE,
     ROUTE_ROUND_NO_ACTIONS,
     ROUTE_ROUND_NOTE_ACCEPTED,
     ROUTE_ROUND_NOTE_CONFLICT,
     ROUTE_ROUND_NOTE_DUPLICATE,
+    ROUTE_ROUND_OPEN_QUESTIONS_ADDED,
     ROUTE_ROUND_RETRIEVAL_EMPTY,
+    ROUTE_ROUND_SEARCH_PLANNED,
+    ROUTE_ROUND_STARTED,
     ROUTE_SCORE_CANDIDATE_ACCEPTED,
     ROUTE_SCORE_CANDIDATE_REJECTED_MEMORY_VALUE,
     ROUTE_SCORE_CANDIDATE_REJECTED_RELEVANCE,
@@ -41,6 +47,39 @@ from state_aware_rag.run_log import (
 from state_aware_rag.store import SQLiteRagStore
 from state_aware_rag.strategy import SearchStrategy, SocraticSearchStrategy
 from state_aware_rag.text import MSG_DEMEMOIZATION_FAILED, MSG_NO_EVIDENCE, normalize_claim, overlap_score
+
+
+def _search_action_details(actions: list[SearchAction]) -> list[dict[str, object]]:
+    return [
+        {
+            "action_id": action.action_id,
+            "sub_question": action.sub_question,
+            "vector_query": action.vector_query,
+            "text_query": action.text_query,
+            "graph_seed_entities": action.graph_seed_entities,
+            "priority": action.priority,
+        }
+        for action in actions
+    ]
+
+
+def _open_question_details(open_questions: list[OpenQuestion]) -> list[dict[str, str]]:
+    return [{"question": item.question, "reason": item.reason} for item in open_questions]
+
+
+def _loop_continue_reason(
+    *,
+    open_question_count: int,
+    active_note_count: int,
+    accepted_note_count: int,
+) -> str:
+    if open_question_count > 0:
+        return "open_questions_remaining"
+    if active_note_count == 0 and accepted_note_count == 0:
+        return "no_active_notes_yet"
+    if accepted_note_count > 0:
+        return "new_notes_created"
+    return "continuing"
 
 
 class StateAwareRag:
@@ -130,6 +169,22 @@ class StateAwareRag:
         for round_number in range(1, self.config.max_rounds + 1):
             notes = self.store.list_memory_notes(wm.id)
             open_questions = self._open_questions(wm.id)
+            logger.log(
+                ROUTE_ROUND_STARTED,
+                component="orchestrator",
+                outcome="success",
+                reason_code="round_started",
+                reason_detail=f"Round {round_number} started",
+                working_memory_id=wm.id,
+                round_number=round_number,
+                accepted_note_count=len(notes),
+                extra={
+                    "open_question_count": len(open_questions),
+                    "active_note_count": len(notes),
+                    "previous_query_count": len(previous_queries),
+                    "open_questions": _open_question_details(open_questions),
+                },
+            )
             state = SearchState(
                 question=question,
                 working_memory_id=wm.id,
@@ -145,6 +200,24 @@ class StateAwareRag:
                 SearchBudget(max_actions=self.config.max_sub_questions_per_round),
                 state,
             )
+            logger.log(
+                ROUTE_ROUND_SEARCH_PLANNED,
+                component="strategy",
+                outcome="success" if selected else "skipped",
+                reason_code="search_planned",
+                reason_detail=(
+                    f"LLM planned {len(actions)} action(s); {len(selected)} selected for retrieval"
+                ),
+                working_memory_id=wm.id,
+                round_number=round_number,
+                candidate_count=len(selected),
+                extra={
+                    "proposed_count": len(actions),
+                    "selected_count": len(selected),
+                    "actions": _search_action_details(selected),
+                    "open_questions": _open_question_details(open_questions),
+                },
+            )
             if not selected:
                 stop_status = WorkingMemoryStatus.COMPLETED
                 logger.log(
@@ -158,6 +231,15 @@ class StateAwareRag:
                     stop_status=stop_status.value,
                 )
                 self._record_log(wm.id, round_number, [], 0, [], 0, 0, 0, 0, 0.0, stop_status.value, action_details=[])
+                self._log_round_loop_decision(
+                    logger,
+                    wm_id=wm.id,
+                    round_number=round_number,
+                    stop_status=stop_status,
+                    open_question_count=len(open_questions),
+                    active_note_count=len(notes),
+                    accepted_note_count=0,
+                )
                 break
 
             all_candidates: list[RetrievalCandidate] = []
@@ -232,19 +314,18 @@ class StateAwareRag:
                     0,
                     gain,
                     stop_status.value if stop_status else None,
-                    action_details=[
-                        {
-                            "action_id": a.action_id,
-                            "sub_question": a.sub_question,
-                            "vector_query": a.vector_query,
-                            "text_query": a.text_query,
-                            "graph_seed_entities": a.graph_seed_entities,
-                            "priority": a.priority,
-                        }
-                        for a in selected
-                    ],
+                    action_details=_search_action_details(selected),
                 )
                 self.store.update_working_memory(wm.id, round_count=round_number)
+                self._log_round_loop_decision(
+                    logger,
+                    wm_id=wm.id,
+                    round_number=round_number,
+                    stop_status=stop_status,
+                    open_question_count=len(open_questions),
+                    active_note_count=len(notes),
+                    accepted_note_count=0,
+                )
                 if stop_status:
                     break
                 continue
@@ -281,9 +362,25 @@ class StateAwareRag:
                 created_notes,
                 logger,
             )
-            if created_notes.get("open_questions"):
-                for item in created_notes["open_questions"]:
+            open_question_items = list(created_notes.get("open_questions") or [])
+            if open_question_items:
+                for item in open_question_items:
                     self.store.add_open_question(wm.id, str(item["question"]), str(item.get("reason", "")))
+                logger.log(
+                    ROUTE_ROUND_OPEN_QUESTIONS_ADDED,
+                    component="llm",
+                    outcome="success",
+                    reason_code="open_questions_added",
+                    reason_detail=f"LLM added {len(open_question_items)} open question(s) for later rounds",
+                    working_memory_id=wm.id,
+                    round_number=round_number,
+                    extra={
+                        "open_questions": [
+                            {"question": str(item["question"]), "reason": str(item.get("reason", ""))}
+                            for item in open_question_items
+                        ],
+                    },
+                )
 
             if accepted_count > 0:
                 no_new_note_rounds = 0
@@ -313,19 +410,18 @@ class StateAwareRag:
                 conflict_count,
                 gain,
                 stop_status.value if stop_status else None,
-                action_details=[
-                    {
-                        "action_id": a.action_id,
-                        "sub_question": a.sub_question,
-                        "vector_query": a.vector_query,
-                        "text_query": a.text_query,
-                        "graph_seed_entities": a.graph_seed_entities,
-                        "priority": a.priority,
-                    }
-                    for a in selected
-                ],
+                action_details=_search_action_details(selected),
             )
             self.store.update_working_memory(wm.id, round_count=round_number)
+            self._log_round_loop_decision(
+                logger,
+                wm_id=wm.id,
+                round_number=round_number,
+                stop_status=stop_status,
+                open_question_count=len(current_open_questions),
+                active_note_count=current_active_note_count,
+                accepted_note_count=accepted_count,
+            )
             if stop_status:
                 break
 
@@ -616,6 +712,59 @@ class StateAwareRag:
                 continue
             if normalized_question in normalized_claim or overlap_score(normalized_claim, normalized_question) >= 0.20:
                 self.store.resolve_open_question(working_memory_id, item.question)
+
+    def _log_round_loop_decision(
+        self,
+        logger: RunLogger,
+        *,
+        wm_id: str,
+        round_number: int,
+        stop_status: WorkingMemoryStatus | None,
+        open_question_count: int,
+        active_note_count: int,
+        accepted_note_count: int,
+    ) -> None:
+        if stop_status is not None:
+            logger.log(
+                ROUTE_ROUND_LOOP_STOPPED,
+                component="orchestrator",
+                outcome="success",
+                reason_code=stop_status.value,
+                reason_detail=f"Stopping after round {round_number}: {stop_status.value}",
+                working_memory_id=wm_id,
+                round_number=round_number,
+                stop_status=stop_status.value,
+                extra={
+                    "open_question_count": open_question_count,
+                    "active_note_count": active_note_count,
+                },
+            )
+            return
+        if round_number >= self.config.max_rounds:
+            return
+        continue_reason = _loop_continue_reason(
+            open_question_count=open_question_count,
+            active_note_count=active_note_count,
+            accepted_note_count=accepted_note_count,
+        )
+        logger.log(
+            ROUTE_ROUND_LOOP_CONTINUE,
+            component="orchestrator",
+            outcome="success",
+            reason_code="continuing_to_next_round",
+            reason_detail=(
+                f"Round {round_number} finished; continuing to round {round_number + 1} "
+                f"because {continue_reason}."
+            ),
+            working_memory_id=wm_id,
+            round_number=round_number,
+            extra={
+                "next_round": round_number + 1,
+                "continue_reason": continue_reason,
+                "open_question_count": open_question_count,
+                "active_note_count": active_note_count,
+            },
+        )
 
     def _stop_status(
         self,

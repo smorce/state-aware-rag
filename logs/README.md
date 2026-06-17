@@ -12,6 +12,11 @@
 ## 主な `route` 値
 
 - `answer.session_start` — セッション開始
+- `round.started` — ラウンド開始（`open_questions` / active note 数を `extra_json` に記録）
+- `round.search_planned` — LLM が小質問と検索クエリを生成し、アクションを選択した直後
+- `round.open_questions_added` — LLM が未解決の open_question を追加（次ラウンド継続の根拠）
+- `round.loop_continue` — 次ラウンドへ継続（`continue_reason=open_questions_remaining` など）
+- `round.loop_stopped` — ラウンド終了時にループ停止（`completed` / `stopped_by_no_new_notes` など）
 - `score.candidate_rejected.relevance_below_threshold` — Bosun relevance 未満で棄却（**確定理由**）
 - `score.candidate_rejected.memory_value_below_threshold` — Bosun memory_value 未満で棄却
 - `score.candidate_accepted` — Evidence 採用

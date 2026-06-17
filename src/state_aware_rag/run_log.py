@@ -12,6 +12,11 @@ Outcome = Literal["success", "failure", "skipped"]
 
 ROUTE_ANSWER_SESSION_START = "answer.session_start"
 ROUTE_ANSWER_UNHANDLED_EXCEPTION = "answer.unhandled_exception"
+ROUTE_ROUND_STARTED = "round.started"
+ROUTE_ROUND_SEARCH_PLANNED = "round.search_planned"
+ROUTE_ROUND_OPEN_QUESTIONS_ADDED = "round.open_questions_added"
+ROUTE_ROUND_LOOP_CONTINUE = "round.loop_continue"
+ROUTE_ROUND_LOOP_STOPPED = "round.loop_stopped"
 ROUTE_ROUND_NO_ACTIONS = "round.no_actions_selected"
 ROUTE_ROUND_RETRIEVAL_EMPTY = "round.retrieval_empty"
 ROUTE_SCORE_CANDIDATE_REJECTED_RELEVANCE = "score.candidate_rejected.relevance_below_threshold"
