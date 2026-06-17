@@ -129,11 +129,14 @@ WorkingMemory だけを使って最終回答を生成する
   "body": "検索対象となる本文",
   "embedding": [0.01, 0.02, 0.03],
   "token_count": 320,
+  "position": 0,
   "section_title": "章タイトル",
   "source_uri": "元文書の場所",
   "metadata": {}
 }
 ```
+
+`position` は、同一 `document_id` 内での並び順（0 始まり）である。Document 内の前後 Chunk 探索で使う。Helix backend では全文検索用に `body` を正規化した文字列を格納し、表示用の原文は Python 側 SQLite mirror が保持する。
 
 ### 4.5 WorkingMemory ノード
 
@@ -216,6 +219,7 @@ Evidence は、検索候補のうち採用された根拠である。
 {
   "id": "ev_001",
   "chunk_id": "chunk_001",
+  "working_memory_id": "wm_001",
   "round": 1,
   "query": "検索クエリ",
   "body_excerpt": "根拠として使う本文の抜粋",
@@ -226,6 +230,8 @@ Evidence は、検索候補のうち採用された根拠である。
   "accepted": true
 }
 ```
+
+`working_memory_id` は、Helix backend で質問ごとの採用済み Evidence をグラフ探索から引くために使う。SQLite mirror にも同じ値を保持する。
 
 `retrieval_method` は次のいずれかにする。
 
@@ -307,7 +313,16 @@ hybrid
 - 既に作業用メモにある Entity から関連 Chunk を探す
 - 採用済み Evidence と同じ Document の前後 Chunk を探す
 - MemoryNote と RELATED_TO でつながる Entity から追加情報を探す
-- CONFLICTS_WITH の可能性がある Note を探す
+- CONFLICTS_WITH の可能性がある Note から、矛盾相手の Evidence 由来 Chunk を探す
+- CONFLICTS_WITH の可能性がある Note と RELATED_TO でつながる Entity から Chunk を探す
+```
+
+候補には、発見経路を説明する `graph_reason` を付ける。代表例:
+
+```text
+採用済み Evidence と同じ Document の前後 Chunk
+矛盾の可能性がある MemoryNote 経由で発見
+既存メモ note_001 の Entity 経由で発見
 ```
 
 出力:
@@ -319,11 +334,31 @@ hybrid
     {
       "chunk_id": "chunk_020",
       "body": "候補本文",
-      "graph_reason": "既存メモ note_001 の Entity 経由で発見"
+      "graph_reason": "採用済み Evidence と同じ Document の前後 Chunk"
     }
   ]
 }
 ```
+
+### 5.3.1 Helix backend でのグラフ走査経路
+
+CLI 既定 backend（`--backend helix`）では、グラフ探索候補の**発見**は HelixDB 上の read query（dynamic query JSON）で行う。Python 側 SQLite mirror は、候補 Chunk の原文 `body` 復元と型復元に使い、探索ロジックの正にはしない。
+
+最低限、次の走査経路を Helix で実装する。
+
+| 目的 | 走査経路（概念） | `graph_reason`（代表） |
+|------|------------------|------------------------|
+| Entity 起点 | `Entity ← MENTIONS - Chunk`（計画時の seed entity 含む） | Entity 経由 |
+| 採用済み Evidence 近傍 | `WorkingMemory → HAS_NOTE → SUPPORTED_BY → Evidence → FROM_CHUNK → Chunk` | （統合時に他経路と merge） |
+| Document 前後 Chunk | `Evidence(working_memory_id) → FROM_CHUNK → Chunk → in(HAS_CHUNK) → Document → out(HAS_CHUNK) → Chunk`、`abs(position差) <= 1` で絞る | 採用済み Evidence と同じ Document の前後 Chunk |
+| 矛盾相手の Evidence | `WorkingMemory → HAS_NOTE → CONFLICTS_WITH → SUPPORTED_BY → FROM_CHUNK → Chunk` | 矛盾の可能性がある MemoryNote 経由で発見 |
+| 矛盾 note の Entity 展開 | `WorkingMemory → HAS_NOTE → CONFLICTS_WITH → RELATED_TO → Entity ← MENTIONS - Chunk` | 矛盾の可能性がある MemoryNote 経由で発見 |
+
+`position` による前後 1 件への絞り込みは、Helix DSL で表現しづらい場合、Helix から取得した sibling Chunk を Python 側でフィルタしてよい。
+
+`--backend sqlite` では、同等の探索面を SQL とアプリ内ロジックで実装してよい（Helix 走査経路に完全一致する必要はない）。
+
+実装計画: [`plans/helix-document-neighbor-native-plan.md`](../plans/helix-document-neighbor-native-plan.md)
 
 ### 5.4 候補の統合
 
@@ -1063,6 +1098,7 @@ WorkingMemory 内の active な MemoryNote と Evidence 情報だけを渡す。
 - 採用済み Evidence の周辺 Chunk 探索
 - MemoryNote と関連 Entity の探索
 - Document 内の前後 Chunk 補完
+- Helix backend でのグラフ探索候補発見（§5.3.1。SQLite mirror は原文表示のみ）
 - SearchStrategy インターフェース
 - MctsSearchStrategy
 - 最終回答生成
@@ -1103,6 +1139,7 @@ WorkingMemory 内の active な MemoryNote と Evidence 情報だけを渡す。
 8. 矛盾は消さずに、CONFLICTS_WITH として残す。
 9. 重複は新規メモにせず、既存メモの根拠を増やす。
 10. 最終回答は WorkingMemory だけを使う。
+11. Helix backend ではグラフ探索候補の発見を HelixDB 上で行い、SQLite mirror に探索ロジックを委譲しない（mirror は原文表示と型復元に限定する）。
 
 ---
 
