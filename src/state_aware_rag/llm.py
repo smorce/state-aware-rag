@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from state_aware_rag.json_parse import parse_json_object
+from state_aware_rag.language import detect_language
 from state_aware_rag.models import Evidence, MemoryNote, OpenQuestion
 from state_aware_rag.text import MSG_NO_EVIDENCE, compact_fact, extract_entities, normalize_claim, split_sentences, tokenize
 
@@ -301,6 +302,23 @@ class JsonLlamaPlannerAndWriter(LocalHeuristicLLM):
                 raise RuntimeError(f"llama-server returned invalid JSON after retry: {text2}") from exc
 
     def plan(self, question: str, working_memory: list[MemoryNote], open_questions: list[OpenQuestion], round_number: int, max_actions: int) -> list[dict[str, Any]]:
+        question_language = detect_language(question)
+        if question_language == "ja":
+            language_instruction = "sub_question / vector_query / text_query / graph_seed_entities は日本語で統一してください。"
+            template_examples = [
+                "sub_question: 「『<主張>』は真か偽か？」",
+                "vector_query: \"<主張> evidence for and against\" の日本語同等表現",
+                "text_query: \"<主張> 真 偽 根拠\"",
+                "graph_seed_entities: [\"主語エンティティ\", \"比較対象エンティティ\", \"検証概念\"]",
+            ]
+        else:
+            language_instruction = "Write sub_question / vector_query / text_query / graph_seed_entities in English."
+            template_examples = [
+                'sub_question: "Is it true that <claim>?"',
+                'vector_query: "evidence for and against <claim>"',
+                'text_query: "\\"<claim>\\" true false evidence"',
+                'graph_seed_entities: ["subject entity", "comparison entity", "verification concept"]',
+            ]
         prompt = f"""
 元の質問:
 {question}
@@ -315,6 +333,14 @@ class JsonLlamaPlannerAndWriter(LocalHeuristicLLM):
 まだ足りない情報を1〜{max_actions}個の小質問に分けてください。
 各小質問について、ベクトル検索向け、全文検索向け、グラフ探索向けの検索クエリを作ってください。
 すでに作業用メモにある内容は再検索しないでください。
+曖昧語（「関連情報」「詳しく」など）を避け、主張の真偽を検証できる表現を使ってください。
+{language_instruction}
+
+主張検証テンプレート（この形に寄せる）:
+- {template_examples[0]}
+- {template_examples[1]}
+- {template_examples[2]}
+- {template_examples[3]}
 
 出力は JSON のみ:
 {{

@@ -164,9 +164,16 @@ class StateAwareRag:
         low_gain_rounds = 0
         previous_queries: list[str] = []
         stop_status: WorkingMemoryStatus | None = None
-        relevance_threshold, memory_value_threshold, question_language = self.config.scoring_thresholds(question)
+        default_relevance_threshold, default_memory_value_threshold, question_language = self.config.scoring_thresholds(question)
+        relax_relevance_next_round = False
 
         for round_number in range(1, self.config.max_rounds + 1):
+            if relax_relevance_next_round:
+                relevance_threshold = self.config.relaxed_relevance_threshold(question_language, default_relevance_threshold)
+                memory_value_threshold = self.config.strict_memory_value_threshold(default_memory_value_threshold)
+            else:
+                relevance_threshold = default_relevance_threshold
+                memory_value_threshold = default_memory_value_threshold
             notes = self.store.list_memory_notes(wm.id)
             open_questions = self._open_questions(wm.id)
             logger.log(
@@ -182,6 +189,7 @@ class StateAwareRag:
                     "open_question_count": len(open_questions),
                     "active_note_count": len(notes),
                     "previous_query_count": len(previous_queries),
+                    "threshold_adjustment": "relevance_relaxed" if relax_relevance_next_round else "default",
                     "open_questions": _open_question_details(open_questions),
                 },
             )
@@ -274,6 +282,7 @@ class StateAwareRag:
                 question_language=question_language,
             )
             if not accepted_evidence:
+                relax_relevance_next_round = True
                 no_new_note_rounds += 1
                 low_gain_rounds += 1
                 gain = 0.0
@@ -330,6 +339,7 @@ class StateAwareRag:
                     break
                 continue
 
+            relax_relevance_next_round = False
             created_notes = self.llm.create_atomic_notes(question, self.store.list_memory_notes(wm.id), accepted_evidence)
             note_items = list(created_notes.get("notes", []))
             if not note_items:

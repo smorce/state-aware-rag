@@ -19,6 +19,7 @@ class RagConfig:
     memory_value_threshold_mixed: float = 0.55
     relevance_threshold_other: float = 0.55
     memory_value_threshold_other: float = 0.55
+    relevance_threshold_relaxed_en: float = 0.64
     duplicate_threshold: float = 0.80
     conflict_threshold: float = 0.70
     no_new_note_limit: int = 1
@@ -39,3 +40,13 @@ class RagConfig:
         if language == "other":
             return self.relevance_threshold_other, self.memory_value_threshold_other, language
         return self.relevance_threshold, self.memory_value_threshold, language
+
+    def relaxed_relevance_threshold(self, question_language: LanguageTag, default_threshold: float) -> float:
+        """採択ゼロの次ラウンドだけ適用する relevance 閾値。"""
+        if question_language == "en":
+            return min(default_threshold, self.relevance_threshold_relaxed_en)
+        return default_threshold
+
+    def strict_memory_value_threshold(self, default_threshold: float) -> float:
+        """relevance を緩和しても memory_value は下げない。"""
+        return max(default_threshold, self.memory_value_threshold)
